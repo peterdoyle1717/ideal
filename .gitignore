@@ -1,0 +1,10 @@
+src/horou_c
+src/horoz_c
+src/proof_c
+src/*.o
+proof_*.bin
+tmp_proof/
+tmp_findeps/
+*.pyc
+__pycache__/
+.DS_Store
