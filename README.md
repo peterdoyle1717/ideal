@@ -1,195 +1,131 @@
-# neo/ideal — Ideal Horoball Packing
+# ideal
 
-Tools for computing ideal horoball packings of triangulated spheres and
-proving their existence via a sub/supersolution bracket.
+Ideal horoball packings of triangulated spheres: solvers, placements, and bracket proofs.
 
-**Input:** face lists `a,b,c;d,e,f;...` (one triangulation per line),
-as produced by `neo/clers/python/clers_decode.py`.
+This repository contains small C and Python tools for computing ideal horoball packings of triangulated spheres and for certifying existence by a sub/supersolution bracket. It is a project tool rather than a polished package.
 
----
+Input is a face list
 
-## What is an ideal horoball packing?
+    a,b,c;d,e,f;...
 
-A triangulated sphere has an *ideal horoball packing* when each vertex carries
-a weight `u[v] > 0` such that the angle sum around every interior vertex equals
-2π. The edge length between adjacent vertices `i` and `j` is `u[i]*u[j]` (the
-product metric). One vertex is sent to infinity; its neighbors are pinned to
-`u = 1` (boundary). The remaining (interior) weights are the solution.
+one triangulation per line.
 
-The packing always exists (proven here for all prime 6-nets through v = 100).
+## Scope
 
----
+The underlying geometric model is the usual product metric: adjacent vertices `i` and `j` have edge length `u[i] u[j]`, with one vertex sent to infinity and its neighbors pinned on the boundary. The unknowns are the remaining positive vertex weights.
+
+This repository has two main jobs:
+
+- compute the weights and associated flat placement
+- certify existence by a bracket argument with explicit slack checks
+
+The motivating combinatorial inputs in the broader project are prime 6-nets, but the basic tools take triangulated-sphere face lists as input.
 
 ## Layout
 
-```
-ideal/
-├── Makefile
-├── data/
-│   └── eps_needed.txt       # smallest eps proving all prime 6-nets, v=4..80
-├── python/
-│   ├── horou.py             # Newton solver for horoball weights u[v]
-│   ├── horoz.py             # BFS placement of vertices in the upper half-plane
-│   └── proof.py             # sub/supersolution existence proof (CLI + library)
-├── scripts/
-│   ├── run_proof_doob.sh    # parallel proof runner for doob
-│   └── find_eps.sh          # find smallest eps that proves all nets at given v
-└── src/
-    ├── horou_c.c            # fast Newton solver (C)
-    ├── horoz_c.c            # fast solver + BFS placement (C)
-    └── proof_c.c            # fast prover (C)
-```
-
----
+    ideal/
+    ├── Makefile
+    ├── data/
+    │   └── eps_needed.txt
+    ├── python/
+    │   ├── horou.py
+    │   ├── horoz.py
+    │   └── proof.py
+    ├── scripts/
+    │   ├── run_proof_doob.sh
+    │   └── find_eps.sh
+    └── src/
+        ├── horou_c.c
+        ├── horoz_c.c
+        └── proof_c.c
 
 ## Build
 
-```bash
-make          # builds src/horou_c, src/horoz_c, src/proof_c
-make clean
-```
+    make
+    make clean
 
-Requires: a C compiler and libm (standard on macOS and Linux).
+Requires a C compiler and `libm` (standard on macOS and Linux).
 
----
+## Main tools
 
-## Tools
+### horou
 
-### horou — horoball weights
+Solve for the horoball weights `u[v]` of a triangulation.
 
-Solve for weights `u[v]` given a triangulation.
+C version:
 
-**C (fast):**
-```bash
-python3 ../clers/python/clers_decode.py < ../clers/prime/20.txt | src/horou_c > horou/20.bin
-```
-Output: one record of `NV` float64 values per net.
-- `record[0]` = NaN (vertex 1 = point at infinity)
-- `record[v-1]` = 1.0 for boundary vertices, solved weight for interior
+    ../clers/bin/clers decode < 20.txt | src/horou_c > horou/20.bin
 
-**Python (readable):**
-```bash
-echo "CCAE" | python3 ../clers/python/clers_decode.py | python3 python/horou.py
-```
+Python version:
 
----
+    echo "CCAE" | ../clers/bin/clers decode | python3 python/horou.py
 
-### horoz — weights + flat positions
+### horoz
 
-Solve for `u[v]` and place each vertex at `(x[v], y[v])` in the upper
-half-plane via BFS over directed edges.
+Solve for the weights and place vertices in the upper half-plane.
 
-**C (fast):**
-```bash
-python3 ../clers/python/clers_decode.py < ../clers/prime/20.txt | src/horoz_c > horoz/20.bin
-```
-Output: one record of `3*NV` float64 values per net.
-- `record[3*(v-1)+0]` = u[v]
-- `record[3*(v-1)+1]` = x[v]
-- `record[3*(v-1)+2]` = y[v]
+C version:
 
-Vertex 1 (infinity) has `u = NaN`, `x = NaN`, `y = NaN`.
-Vertices v1, v2 (first two boundary neighbors) are pinned at (0,0) and (1,0).
+    ../clers/bin/clers decode < 20.txt | src/horoz_c > horoz/20.bin
 
-**Python:**
-```python
-from horou import horou
-from horoz import horoz
-u   = horou(poly)
-pos = horoz(poly, u)   # dict: vertex -> (x, y)
-```
+Python usage:
 
----
+    from horou import horou
+    from horoz import horoz
+    u = horou(poly)
+    pos = horoz(poly, u)
 
-### proof — sub/supersolution existence proof
+### proof
 
-Proves that an ideal horoball packing exists by bracketing the solution
-between a sub-solution (angle sums > 2π) and a super-solution (angle sums < 2π).
+Certify existence by bracketing the solution between a sub-solution and a super-solution.
 
-**The five checks** (all must pass with positive slack):
+The proof code checks five positive-slack conditions:
 
-1. **mono** — super-solution weight > sub-solution weight at every interior vertex
-2. **excess** — sub-solution angle sums exceed 2π; super-solution sums fall below 2π
-3. **triangle** — triangle inequality holds for all weights in the bracket
-4. **convex** — Delaunay/butterfly condition for every interior edge
-5. **boundary** — boundary horoball subtended angles are less than π
+- mono
+- excess
+- triangle
+- convex
+- boundary
 
-A bracket `[umin, umax]` with `umin = horou(defect=-eps)` and
-`umax = horou(defect=+eps)` is tried starting at `eps = 1/500`, halving
-until all five checks pass or `eps` falls below `1/500000`.
+Python examples:
 
-**Python (readable proof):**
-```bash
-# Prove a single net
-echo "CCAE" | python3 ../clers/python/clers_decode.py | python3 python/proof.py --verbose
+    echo "CCAE" | ../clers/bin/clers decode | python3 python/proof.py --verbose
 
-# Prove all v=20 nets
-python3 ../clers/python/clers_decode.py < ../clers/prime/20.txt | python3 python/proof.py
-```
+    ../clers/bin/clers decode < 20.txt | python3 python/proof.py
 
-Sample output (verbose):
-```
-    mono:     0.00372
-    excess:   0.00199
-    triangle: 0.0814
-    convex:   0.284
-    boundary: 0.0403
-PROVED   slack=0.0020  eps=1/500
-```
+C example:
 
-**C (fast prover):**
-```bash
-python3 ../clers/python/clers_decode.py < ../clers/prime/20.txt | src/proof_c > proof_20.bin
-```
-Output: one float64 per net — `slack/eps > 0` if proved, `NaN` if solver failed.
+    ../clers/bin/clers decode < 20.txt | src/proof_c > proof_20.bin
 
----
+## Results currently checked in
 
-## Results
+The checked-in table `data/eps_needed.txt` records the smallest tested `eps` proving all prime 6-nets for each `v` through `v = 80`.
 
-All prime 6-nets through **v = 80** (73,920,746 nets at v = 80) are proved.
-The eps needed stabilizes at **1/8000** from v = 60 onward.
+In particular:
 
-```
- v    eps_needed      nets
- 4    1/500              1
- 6    1/500              1
-...
-25    1/1000          4711
-...
-44    1/4000        483170
-...
-60    1/8000       6,464,974
-80    1/8000      73,920,746
-```
+- the checked-in results currently go through `v = 80`
+- `1/8000` suffices from `v = 60` through `v = 80`
 
-See `data/eps_needed.txt` for the full table.
+## Parallel scripts
 
----
+For server-side runs:
 
-## Parallel proof on a server (doob)
+    ./scripts/run_proof_doob.sh 81
+    ./scripts/run_proof_doob.sh 81 100
+    ./scripts/find_eps.sh 81
 
-```bash
-# Prove a single vertex count
-./scripts/run_proof_doob.sh 81
+These are project scripts for batch runs, not general installation machinery.
 
-# Prove a range
-./scripts/run_proof_doob.sh 81 100
+## Notes
 
-# Find the smallest eps needed for a given v
-./scripts/find_eps.sh 81
-```
+This repository sits in the circle-packing / discrete-conformal / ideal-polyhedral orbit of ideas, but it is not meant to be a survey or exposition. The point is to keep the computational core small, explicit, and inspectable.
 
-`run_proof_doob.sh` splits the input into 80 shards, runs them in parallel with
-`nice -n 19`, and concatenates results into `proof_N.bin`.  Requires GNU
-`parallel`.
+Where the separate `clers` repository handles combinatorial naming and decoding of triangulations, this repository handles the ideal horoball-packing side.
 
----
+## Provenance
 
-## Dependencies
+The code and documentation in this repository were drafted primarily with Claude Code under the author's direction, with additional advice, review, and supervision from ChatGPT.
 
-- **C tools:** standard C compiler, libm
-- **Python tools:** Python 3, numpy (`horou.py`, `horoz.py`)
-- **Parallel scripts:** GNU parallel, `neo/clers/python/clers_decode.py`
-- **Prime net data:** `neo/clers/prime/N.txt` (bundled for v = 4..25;
-  larger files generated by `neo/clers/scripts/grow.sh`)
+## License
+
+See `LICENSE`.
