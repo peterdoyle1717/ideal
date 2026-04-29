@@ -8,3 +8,4 @@ tmp_findeps/
 *.pyc
 __pycache__/
 .DS_Store
+src/puffup_c
