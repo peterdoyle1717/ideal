@@ -695,14 +695,19 @@ typedef struct {
 static double bends_curr[MAXE];
 static double bends_trial[MAXE];
 
+/* Runtime params (set from main via --tol, --max-newton, --init-step). */
+static double CFG_LOOSE_TOL          = 1e-3;
+static int    CFG_MAX_NEWTON         = 8;
+static double CFG_ALPHA_STEP_INIT_DEG = 1.0;
+
 static HomotopyResult homotopy(const double bends_init[]) {
     const double GOAL = M_PI / 3.0;
     const double ALPHA_FINAL = GOAL * (1.0 - 1e-12);
-    const double ALPHA_STEP_INIT = M_PI / 180.0;  /* 1° */
+    const double ALPHA_STEP_INIT = CFG_ALPHA_STEP_INIT_DEG * M_PI / 180.0;
     const double MIN_ALPHA_STEP = 1e-12;
-    const int    MAX_ATTEMPTS = 4000;             /* enough for v=40 perfect pancakes */
-    const int    MAX_NEWTON_ITERS = 8;
-    const double LOOSE_TOL = 1e-3;                /* tol during stepping */
+    const int    MAX_ATTEMPTS = 8000;             /* large enough for retry params */
+    const int    MAX_NEWTON_ITERS = CFG_MAX_NEWTON;
+    const double LOOSE_TOL = CFG_LOOSE_TOL;
     const double TIGHT_TOL = 1e-12;               /* final cleanup at α_curr */
 
     memcpy(bends_curr, bends_init, NE*sizeof(double));
@@ -869,11 +874,21 @@ int main(int argc, char **argv) {
     static double u[MAXV];
     static double bends_init[MAXE];
 
-    /* Optional: --obj-dir DIR  →  write OBJ for every successful case to DIR/<n>.obj */
+    /* CLI flags:
+     *   --tol N          stepping tolerance (default 1e-3)
+     *   --max-newton N   Newton max iters per step (default 8)
+     *   --init-step N    initial α step in degrees (default 1.0)
+     *   --obj-dir DIR    write OBJ per successful case to DIR/<n>.obj
+     */
     const char *obj_dir = NULL;
     for (int i = 1; i < argc - 1; i++) {
-        if (!strcmp(argv[i], "--obj-dir")) obj_dir = argv[i+1];
+        if      (!strcmp(argv[i], "--obj-dir"))    obj_dir = argv[i+1];
+        else if (!strcmp(argv[i], "--tol"))        CFG_LOOSE_TOL = atof(argv[i+1]);
+        else if (!strcmp(argv[i], "--max-newton")) CFG_MAX_NEWTON = atoi(argv[i+1]);
+        else if (!strcmp(argv[i], "--init-step"))  CFG_ALPHA_STEP_INIT_DEG = atof(argv[i+1]);
     }
+    fprintf(stderr, "puffup: tol=%g max_newton=%d init_step=%g°\n",
+            CFG_LOOSE_TOL, CFG_MAX_NEWTON, CFG_ALPHA_STEP_INIT_DEG);
 
     long n_in = 0, n_ok = 0;
     while (fgets(line, sizeof(line), stdin)) {
