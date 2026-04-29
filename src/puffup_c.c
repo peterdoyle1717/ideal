@@ -941,16 +941,22 @@ int main(int argc, char **argv) {
         n_in++;
 
         if (!parse_facelist(line)) {
-            printf("parse 0 0 0 0 0.0\n");
+            printf("parse 0 0 0 0 0.0 0\n");
+            continue;
+        }
+        if (NV > MAXV) {
+            fprintf(stderr, "ERROR: NV=%d exceeds MAXV=%d "
+                            "(rebuild puffup with larger MAXV)\n", NV, MAXV);
+            printf("size_too_big %d 0 0 0 0.0 0\n", NV);
             continue;
         }
         if (build() < 0) {
-            printf("deg_too_high %d 0 0 0 0.0\n", NV);
+            printf("deg_too_high %d 0 0 0 0.0 0\n", NV);
             build_clear();
             continue;
         }
         if (horou(u) < 0) {
-            printf("horou %d 0 0 0 0.0\n", NV);
+            printf("horou %d 0 0 0 0.0 0\n", NV);
             build_clear();
             continue;
         }
@@ -962,9 +968,9 @@ int main(int argc, char **argv) {
         if (r.status == 0) {
             /* solve base bends, then optionally reconstruct + write OBJ */
             if (complete_base_bends(r.final_alpha, bends_curr) < 0) {
-                printf("base_bend_fail %d %d %d %d %.10f\n",
+                printf("base_bend_fail %d %d %d %d %.10f %d\n",
                        NV, r.n_steps, r.n_halve, r.newton_iters,
-                       r.final_alpha * 180.0 / M_PI);
+                       r.final_alpha * 180.0 / M_PI, retry_used);
                 build_clear();
                 continue;
             }
