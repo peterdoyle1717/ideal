@@ -695,20 +695,27 @@ typedef struct {
 static double bends_curr[MAXE];
 static double bends_trial[MAXE];
 
-/* Runtime params (set from main via --tol, --max-newton, --init-step). */
-static double CFG_LOOSE_TOL          = 1e-3;
-static int    CFG_MAX_NEWTON         = 8;
+/* Default homotopy params (override via CLI flags from main). */
+static double CFG_LOOSE_TOL           = 1e-3;
+static int    CFG_MAX_NEWTON          = 8;
 static double CFG_ALPHA_STEP_INIT_DEG = 1.0;
 
-static HomotopyResult homotopy(const double bends_init[]) {
+/* Retry params if first pass fails. Set via --retry-tol etc. */
+static double CFG_RETRY_TOL           = 1e-8;
+static int    CFG_RETRY_MAX_NEWTON    = 50;
+static double CFG_RETRY_INIT_DEG      = 0.25;
+
+static HomotopyResult homotopy_with(const double bends_init[],
+                                     double init_step_deg, int max_newton_iters,
+                                     double loose_tol) {
     const double GOAL = M_PI / 3.0;
     const double ALPHA_FINAL = GOAL * (1.0 - 1e-12);
-    const double ALPHA_STEP_INIT = CFG_ALPHA_STEP_INIT_DEG * M_PI / 180.0;
+    const double ALPHA_STEP_INIT = init_step_deg * M_PI / 180.0;
     const double MIN_ALPHA_STEP = 1e-12;
     const int    MAX_ATTEMPTS = 8000;             /* large enough for retry params */
-    const int    MAX_NEWTON_ITERS = CFG_MAX_NEWTON;
-    const double LOOSE_TOL = CFG_LOOSE_TOL;
-    const double TIGHT_TOL = 1e-12;               /* final cleanup at α_curr */
+    const int    MAX_NEWTON_ITERS = max_newton_iters;
+    const double LOOSE_TOL = loose_tol;
+    const double TIGHT_TOL = 1e-12;
 
     memcpy(bends_curr, bends_init, NE*sizeof(double));
     double alpha_curr = 0.0;
@@ -752,6 +759,25 @@ static HomotopyResult homotopy(const double bends_init[]) {
     }
     HomotopyResult R = {1, n_steps, n_halve, newton_total, alpha_curr};
     return R;
+}
+
+/* Top-level homotopy: try with first-pass params; on failure, retry once
+ * with retry params. Sets *retry_used = 1 if pass 2 was the one that
+ * succeeded (or failed). The standalone use case wants this to "just
+ * work" without external orchestration. */
+static HomotopyResult homotopy(const double bends_init[], int *retry_used) {
+    HomotopyResult R = homotopy_with(bends_init,
+                                       CFG_ALPHA_STEP_INIT_DEG,
+                                       CFG_MAX_NEWTON,
+                                       CFG_LOOSE_TOL);
+    *retry_used = 0;
+    if (R.status == 0 || CFG_RETRY_TOL <= 0) return R;
+    /* first pass stuck — retry with tighter params */
+    *retry_used = 1;
+    return homotopy_with(bends_init,
+                          CFG_RETRY_INIT_DEG,
+                          CFG_RETRY_MAX_NEWTON,
+                          CFG_RETRY_TOL);
 }
 
 /* ---------- reconstruction (3D coords) -----------------------------------
@@ -874,21 +900,38 @@ int main(int argc, char **argv) {
     static double u[MAXV];
     static double bends_init[MAXE];
 
-    /* CLI flags:
-     *   --tol N          stepping tolerance (default 1e-3)
-     *   --max-newton N   Newton max iters per step (default 8)
-     *   --init-step N    initial α step in degrees (default 1.0)
-     *   --obj-dir DIR    write OBJ per successful case to DIR/<n>.obj
+    /* CLI flags. Two-pass: if pass 1 fails, retry with --retry-* params.
+     *   --tol N              pass-1 tolerance (default 1e-3)
+     *   --max-newton N       pass-1 Newton max iters (default 8)
+     *   --init-step N        pass-1 initial α step in degrees (default 1.0)
+     *   --retry-tol N        retry tolerance (default 1e-8)
+     *   --retry-max-newton N retry Newton max iters (default 50)
+     *   --retry-init-step N  retry initial α step in degrees (default 0.25)
+     *   --no-retry           skip retry pass
+     *   --obj-dir DIR        write OBJ per successful case to DIR/<n>.obj
      */
     const char *obj_dir = NULL;
-    for (int i = 1; i < argc - 1; i++) {
-        if      (!strcmp(argv[i], "--obj-dir"))    obj_dir = argv[i+1];
-        else if (!strcmp(argv[i], "--tol"))        CFG_LOOSE_TOL = atof(argv[i+1]);
-        else if (!strcmp(argv[i], "--max-newton")) CFG_MAX_NEWTON = atoi(argv[i+1]);
-        else if (!strcmp(argv[i], "--init-step"))  CFG_ALPHA_STEP_INIT_DEG = atof(argv[i+1]);
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--no-retry")) {
+            CFG_RETRY_TOL = -1.0;   /* sentinel: skip retry */
+            continue;
+        }
+        if (i >= argc - 1) break;
+        if      (!strcmp(argv[i], "--obj-dir"))           obj_dir = argv[i+1];
+        else if (!strcmp(argv[i], "--tol"))               CFG_LOOSE_TOL = atof(argv[i+1]);
+        else if (!strcmp(argv[i], "--max-newton"))        CFG_MAX_NEWTON = atoi(argv[i+1]);
+        else if (!strcmp(argv[i], "--init-step"))         CFG_ALPHA_STEP_INIT_DEG = atof(argv[i+1]);
+        else if (!strcmp(argv[i], "--retry-tol"))         CFG_RETRY_TOL = atof(argv[i+1]);
+        else if (!strcmp(argv[i], "--retry-max-newton"))  CFG_RETRY_MAX_NEWTON = atoi(argv[i+1]);
+        else if (!strcmp(argv[i], "--retry-init-step"))   CFG_RETRY_INIT_DEG = atof(argv[i+1]);
     }
-    fprintf(stderr, "puffup: tol=%g max_newton=%d init_step=%g°\n",
+    fprintf(stderr, "puffup: pass1 tol=%g max_newton=%d init=%g°  ",
             CFG_LOOSE_TOL, CFG_MAX_NEWTON, CFG_ALPHA_STEP_INIT_DEG);
+    if (CFG_RETRY_TOL > 0)
+        fprintf(stderr, "pass2 tol=%g max_newton=%d init=%g°\n",
+                CFG_RETRY_TOL, CFG_RETRY_MAX_NEWTON, CFG_RETRY_INIT_DEG);
+    else
+        fprintf(stderr, "(no retry)\n");
 
     long n_in = 0, n_ok = 0;
     while (fgets(line, sizeof(line), stdin)) {
@@ -914,7 +957,8 @@ int main(int argc, char **argv) {
         compute_bends_at_zero(u, bends_init);
         choose_base_face();
 
-        HomotopyResult r = homotopy(bends_init);
+        int retry_used = 0;
+        HomotopyResult r = homotopy(bends_init, &retry_used);
         if (r.status == 0) {
             /* solve base bends, then optionally reconstruct + write OBJ */
             if (complete_base_bends(r.final_alpha, bends_curr) < 0) {
@@ -936,9 +980,9 @@ int main(int argc, char **argv) {
         const char *status = (r.status == 0) ? "ok"
                             : (r.status == 1) ? "stuck"
                             : "fail";
-        printf("%s %d %d %d %d %.10f\n",
+        printf("%s %d %d %d %d %.10f %d\n",
                status, NV, r.n_steps, r.n_halve, r.newton_iters,
-               r.final_alpha * 180.0 / M_PI);
+               r.final_alpha * 180.0 / M_PI, retry_used);
         if (r.status == 0) n_ok++;
 
         build_clear();

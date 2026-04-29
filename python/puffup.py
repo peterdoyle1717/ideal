@@ -315,6 +315,110 @@ class HomotopyOut:
     message: str
 
 
+# ── halfway-to-60 homotopy + auto-retry, mirrors src/puffup_c.c exactly ──
+
+def _try_full_newton(tri: Tri, base_face: Face, alpha: float,
+                      bends_in: Dict[Edge, float], tol: float, max_iter: int):
+    """Full Newton (no λ damping). Returns (status, bends, iters).
+    status ∈ {'ok', 'dented', 'lstsq_fail', 'max_iter'}."""
+    from jacobian import analytical_jacobian   # local import: same dir
+    base_edges = [edge_key(base_face[i], base_face[(i+1) % 3]) for i in range(3)]
+    var_edges = [e for e in tri.edges if e not in base_edges]
+    base_bend = {e: bends_in[e] for e in base_edges}
+    def F(x):
+        return holonomy_residual(tri, base_face, var_edges, x, base_bend, alpha)
+    def to_b(x):
+        b = dict(bends_in)
+        for e, v in zip(var_edges, x): b[e] = float(v)
+        return b
+    def is_dented(b):
+        return any(vertex_turn(tri, v, b) < 0.0 for v in tri.vertices)
+    x = np.array([bends_in[e] for e in var_edges])
+    for it in range(max_iter):
+        r = F(x)
+        if float(np.linalg.norm(r)) <= tol:
+            return 'ok', to_b(x), it
+        J = analytical_jacobian(tri, base_face, var_edges, x, base_bend, alpha)
+        try:
+            dx = np.linalg.solve(J, -r)
+        except np.linalg.LinAlgError:
+            try:
+                dx, *_ = np.linalg.lstsq(J, -r, rcond=None)
+            except np.linalg.LinAlgError:
+                return 'lstsq_fail', to_b(x), it
+        x = x + dx
+        if is_dented(to_b(x)):
+            return 'dented', to_b(x), it + 1
+    return 'max_iter', to_b(x), max_iter
+
+
+def homotopy_with(tri: Tri, base_face: Face, bends_init: Dict[Edge, float],
+                   init_step_deg: float, max_newton: int, loose_tol: float):
+    """Halfway-to-60° α-additive homotopy. Halve α_step on dent or
+    max_iter, no growth. Final cleanup at TIGHT_TOL=1e-12.
+    Returns dict with status, n_steps, n_halve, newton_iters,
+    final_alpha (radians), bends."""
+    GOAL = math.pi / 3
+    ALPHA_FINAL = GOAL * (1 - 1e-12)
+    MIN_ALPHA_STEP = 1e-12
+    MAX_ATTEMPTS = 8000
+    TIGHT_TOL = 1e-12
+    bends = dict(bends_init)
+    alpha_curr = 0.0
+    alpha_step = math.radians(init_step_deg)
+    n_steps = n_halve = newton_total = 0
+    for _ in range(MAX_ATTEMPTS):
+        if alpha_curr >= ALPHA_FINAL:
+            break
+        cap = (GOAL - alpha_curr) / 2
+        used = min(alpha_step, cap)
+        a_try = alpha_curr + used
+        st, b_new, iters = _try_full_newton(tri, base_face, a_try, bends,
+                                              loose_tol, max_newton)
+        newton_total += iters
+        if st == 'ok':
+            bends = b_new
+            alpha_curr = a_try
+            n_steps += 1
+        else:
+            alpha_step *= 0.5
+            n_halve += 1
+            if alpha_step < MIN_ALPHA_STEP:
+                return {'status': 'stuck', 'n_steps': n_steps, 'n_halve': n_halve,
+                        'newton_iters': newton_total, 'final_alpha': alpha_curr,
+                        'bends': bends}
+    if alpha_curr >= ALPHA_FINAL:
+        st, b_new, iters = _try_full_newton(tri, base_face, alpha_curr, bends,
+                                              TIGHT_TOL, 30)
+        newton_total += iters
+        if st == 'ok':
+            return {'status': 'ok', 'n_steps': n_steps, 'n_halve': n_halve,
+                    'newton_iters': newton_total, 'final_alpha': alpha_curr,
+                    'bends': b_new}
+    return {'status': 'stuck', 'n_steps': n_steps, 'n_halve': n_halve,
+            'newton_iters': newton_total, 'final_alpha': alpha_curr,
+            'bends': bends}
+
+
+def homotopy(tri: Tri, base_face: Face, bends_init: Dict[Edge, float],
+              init_step_deg: float = 1.0, max_newton: int = 8,
+              loose_tol: float = 1e-3,
+              retry_init_deg: float = 0.25, retry_max_newton: int = 50,
+              retry_tol: float = 1e-8):
+    """Top-level: try with first-pass params; on failure, retry with tighter
+    retry params. Mirrors C's main wrapper. Returns dict with extra
+    'retry_used' key (0 or 1)."""
+    R = homotopy_with(tri, base_face, bends_init,
+                       init_step_deg, max_newton, loose_tol)
+    R['retry_used'] = 0
+    if R['status'] == 'ok' or retry_tol <= 0:
+        return R
+    R = homotopy_with(tri, base_face, bends_init,
+                       retry_init_deg, retry_max_newton, retry_tol)
+    R['retry_used'] = 1
+    return R
+
+
 def solve_homotopy(
     tri: Tri,
     base_face: Face,
