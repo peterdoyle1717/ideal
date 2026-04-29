@@ -19,11 +19,11 @@
 #include <string.h>
 #include <math.h>
 
-#define MAXV    400
+#define MAXV    1200      /* room for icosa{5,2}=392 + headroom for bigger subdivisions */
 #define MAXF    (2*MAXV + 4)
 #define MAXE    (3*MAXV - 6)
 #define MAXRING 16
-#define MAXLINE 16384
+#define MAXLINE 65536     /* 16K was tight for V > 400 face lists */
 
 /* number of homotopy variables = non-base bends = E - 3 = 3V-9 */
 #define MAXN    (3*MAXV - 9)
