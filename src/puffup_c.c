@@ -51,12 +51,22 @@ static int  FLOWER[MAXV+1][MAXRING];
 static int  FLOWER_LEN[MAXV+1];
 
 /* ---------- input parser --------------------------------------------------- */
+/* Returns NF on success, 0 on parse failure, -1 on size overflow
+   (NF would exceed MAXF, or any vertex index exceeds MAXV).
+   On -1 the caller should report size_too_big and skip; FACES[] is
+   NOT written past its bound. */
 static int parse_facelist(const char *line) {
     NF = 0; NV = 0;
     const char *p = line;
     while (*p) {
         int a, b, c;
         if (sscanf(p, "%d,%d,%d", &a, &b, &c) != 3) break;
+        if (NF >= MAXF || a > MAXV || b > MAXV || c > MAXV) {
+            if (a > NV) NV = a;
+            if (b > NV) NV = b;
+            if (c > NV) NV = c;
+            return -1;
+        }
         FACES[NF++] = (Face){a, b, c};
         if (a > NV) NV = a;
         if (b > NV) NV = b;
@@ -940,7 +950,14 @@ int main(int argc, char **argv) {
         if (!ll) continue;
         n_in++;
 
-        if (!parse_facelist(line)) {
+        int pr = parse_facelist(line);
+        if (pr < 0) {
+            fprintf(stderr, "ERROR: input exceeds MAXF=%d or MAXV=%d "
+                            "(rebuild puffup with larger limits)\n", MAXF, MAXV);
+            printf("size_too_big %d 0 0 0 0.0 0\n", NV);
+            continue;
+        }
+        if (!pr) {
             printf("parse 0 0 0 0 0.0 0\n");
             continue;
         }
