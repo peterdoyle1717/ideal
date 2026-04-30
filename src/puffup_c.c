@@ -19,7 +19,12 @@
 #include <string.h>
 #include <math.h>
 
-#define MAXV    1200      /* room for icosa{5,2}=392 + headroom for bigger subdivisions */
+#define MAXV    1200      /* room for icosa{5,2}=392 + headroom for bigger subdivisions.
+                             Static cost at MAXV=1200 is ~133 MiB:
+                             EM/EM_F/EDGE_IDX (3×(MAXV+1)² int) ≈ 16.5 MiB,
+                             HJ (MAXV² double)                  ≈ 11 MiB,
+                             Jbuf (3·MAXV·MAXN double)          ≈ 99 MiB.
+                             For MAXV ≫ 1200 replace dense tables with hashes. */
 #define MAXF    (2*MAXV + 4)
 #define MAXE    (3*MAXV - 6)
 #define MAXRING 16
