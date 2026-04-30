@@ -5,6 +5,8 @@ src/*.o
 proof_*.bin
 tmp_proof/
 tmp_findeps/
+tmp_closure/
+.session/
 *.pyc
 __pycache__/
 .DS_Store
