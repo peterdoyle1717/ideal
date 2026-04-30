@@ -43,7 +43,7 @@ mkdir -p "$TMP" "$ROOT/data"
     echo "ideal commit: $(cd "$ROOT" && git rev-parse HEAD)"
     echo "primes data:  $PRIME/{v}.txt"
     echo
-    printf '%-2s  %10s  %10s %4s\n' v primes ok retries
+    printf '%-8s%-12s%-12s%s\n' v primes ok retries
 } > "$OUT"
 
 total_p=0; total_ok=0; total_re=0
@@ -59,9 +59,9 @@ for v in $(seq "$V1" "$V2"); do
         continue
     fi
 
-    nlines=$($zcat "$src" | wc -l)
+    nlines=$($zcat "$src" | grep -c '[A-Z]' || true)
     if [ "$nlines" -eq 0 ]; then
-        printf '%2d  %10d  %10d %4d\n' "$v" 0 0 0 >> "$OUT"
+        printf '%2d%12d%12d%5d\n' "$v" 0 0 0 >> "$OUT"
         continue
     fi
 
@@ -69,7 +69,7 @@ for v in $(seq "$V1" "$V2"); do
     [ "$nlines" -lt "$shards" ] && shards=$nlines
 
     rm -f "$TMP"/cl_${v}_*
-    $zcat "$src" | "$DECODE" decode | split -n "l/$shards" - "$TMP/cl_${v}_"
+    $zcat "$src" | grep '[A-Z]' | "$DECODE" decode | split -n "l/$shards" - "$TMP/cl_${v}_"
 
     nice -n 19 parallel -j "$JOBS" \
         "$PUFFUP < {} > {}.out 2>/dev/null" \
@@ -78,7 +78,7 @@ for v in $(seq "$V1" "$V2"); do
     n_ok=$(awk '$1=="ok"'        "$TMP"/cl_${v}_*.out | wc -l | tr -d ' ')
     n_re=$(awk '$1=="ok" && $7==1' "$TMP"/cl_${v}_*.out | wc -l | tr -d ' ')
 
-    printf '%2d  %10d  %10d %4d\n' "$v" "$nlines" "$n_ok" "$n_re" >> "$OUT"
+    printf '%2d%12d%12d%5d\n' "$v" "$nlines" "$n_ok" "$n_re" >> "$OUT"
 
     total_p=$((total_p + nlines))
     total_ok=$((total_ok + n_ok))
