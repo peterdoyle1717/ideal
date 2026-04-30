@@ -720,10 +720,15 @@ static double CFG_RETRY_TOL           = 1e-8;
 static int    CFG_RETRY_MAX_NEWTON    = 50;
 static double CFG_RETRY_INIT_DEG      = 0.25;
 
+/* Target homotopy endpoint in degrees. Default 60 (Euclidean). Interior
+   values produce a hyperbolic realization with equilateral side
+   length s = arccosh(cos α / (1 − cos α)). */
+static double CFG_TARGET_ALPHA_DEG    = 60.0;
+
 static HomotopyResult homotopy_with(const double bends_init[],
                                      double init_step_deg, int max_newton_iters,
                                      double loose_tol) {
-    const double GOAL = M_PI / 3.0;
+    const double GOAL = CFG_TARGET_ALPHA_DEG * M_PI / 180.0;
     const double ALPHA_FINAL = GOAL * (1.0 - 1e-12);
     const double ALPHA_STEP_INIT = init_step_deg * M_PI / 180.0;
     const double MIN_ALPHA_STEP = 1e-12;
@@ -909,6 +914,22 @@ static void write_obj(FILE *fh) {
     }
 }
 
+/* ---------- bends-file output --------------------------------------------
+ * Writes the homotopy state at the requested target α: per-edge bends
+ * (canonical, EDGE_A[i] < EDGE_B[i]) plus header. realize_c consumes this
+ * to produce a Klein OBJ. */
+static void write_bends(FILE *fh, double alpha, const char *netcode,
+                         const double bend[]) {
+    fprintf(fh, "puffup-bends 1\n");
+    fprintf(fh, "NV %d NE %d alpha_deg %.15g\n",
+            NV, NE, alpha * 180.0 / M_PI);
+    fprintf(fh, "faces %s\n", netcode);
+    fprintf(fh, "bends\n");
+    for (int i = 0; i < NE; i++) {
+        fprintf(fh, "%d %d %.15g\n", EDGE_A[i], EDGE_B[i], bend[i]);
+    }
+}
+
 /* ---------- main ---------------------------------------------------------- */
 int main(int argc, char **argv) {
     static char line[MAXLINE];
@@ -923,9 +944,14 @@ int main(int argc, char **argv) {
      *   --retry-max-newton N retry Newton max iters (default 50)
      *   --retry-init-step N  retry initial α step in degrees (default 0.25)
      *   --no-retry           skip retry pass
-     *   --obj-dir DIR        write OBJ per successful case to DIR/<n>.obj
+     *   --obj-dir DIR        write Euclidean OBJ per case to DIR/<n>.obj
+     *                        (only valid when --target-alpha-deg is 60)
+     *   --target-alpha-deg N halt homotopy at α = N° (default 60)
+     *   --bends-out DIR      write per-edge bends to DIR/<n>.bends
+     *                        (consumed by realize_c for Klein OBJ output)
      */
     const char *obj_dir = NULL;
+    const char *bends_dir = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--no-retry")) {
             CFG_RETRY_TOL = -1.0;   /* sentinel: skip retry */
@@ -933,6 +959,8 @@ int main(int argc, char **argv) {
         }
         if (i >= argc - 1) break;
         if      (!strcmp(argv[i], "--obj-dir"))           obj_dir = argv[i+1];
+        else if (!strcmp(argv[i], "--bends-out"))         bends_dir = argv[i+1];
+        else if (!strcmp(argv[i], "--target-alpha-deg"))  CFG_TARGET_ALPHA_DEG = atof(argv[i+1]);
         else if (!strcmp(argv[i], "--tol"))               CFG_LOOSE_TOL = atof(argv[i+1]);
         else if (!strcmp(argv[i], "--max-newton"))        CFG_MAX_NEWTON = atoi(argv[i+1]);
         else if (!strcmp(argv[i], "--init-step"))         CFG_ALPHA_STEP_INIT_DEG = atof(argv[i+1]);
@@ -940,8 +968,18 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--retry-max-newton"))  CFG_RETRY_MAX_NEWTON = atoi(argv[i+1]);
         else if (!strcmp(argv[i], "--retry-init-step"))   CFG_RETRY_INIT_DEG = atof(argv[i+1]);
     }
-    fprintf(stderr, "puffup: pass1 tol=%g max_newton=%d init=%g°  ",
-            CFG_LOOSE_TOL, CFG_MAX_NEWTON, CFG_ALPHA_STEP_INIT_DEG);
+    if (CFG_TARGET_ALPHA_DEG <= 0 || CFG_TARGET_ALPHA_DEG > 60.0) {
+        fprintf(stderr, "ERROR: --target-alpha-deg must be in (0, 60]\n");
+        return 2;
+    }
+    int target_is_euclidean = (CFG_TARGET_ALPHA_DEG > 60.0 - 1e-9);
+    if (obj_dir && !target_is_euclidean) {
+        fprintf(stderr, "WARN: --obj-dir is Euclidean-only; ignored at α=%g°\n",
+                CFG_TARGET_ALPHA_DEG);
+        obj_dir = NULL;
+    }
+    fprintf(stderr, "puffup: target=%g° pass1 tol=%g max_newton=%d init=%g°  ",
+            CFG_TARGET_ALPHA_DEG, CFG_LOOSE_TOL, CFG_MAX_NEWTON, CFG_ALPHA_STEP_INIT_DEG);
     if (CFG_RETRY_TOL > 0)
         fprintf(stderr, "pass2 tol=%g max_newton=%d init=%g°\n",
                 CFG_RETRY_TOL, CFG_RETRY_MAX_NEWTON, CFG_RETRY_INIT_DEG);
@@ -1003,6 +1041,12 @@ int main(int argc, char **argv) {
                     FILE *fh = fopen(path, "w");
                     if (fh) { write_obj(fh); fclose(fh); }
                 }
+            }
+            if (bends_dir) {
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/%ld.bends", bends_dir, n_in);
+                FILE *fh = fopen(path, "w");
+                if (fh) { write_bends(fh, r.final_alpha, line, bends_curr); fclose(fh); }
             }
         }
         const char *status = (r.status == 0) ? "ok"
