@@ -15,7 +15,7 @@
 #
 # Requires:
 #   src/puffup_c compiled (run: make)
-#   ../clers/python/clers_decode.py
+#   ../clers/bin/clers   (the CLERS decoder C binary)
 #   $PRIME_DIR/N.txt[.gz]  (default: ~/neo/data/primes)
 
 set -e
@@ -23,13 +23,13 @@ set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 PUFFUP="$ROOT/src/puffup_c"
-DECODE="$(cd "$ROOT/../clers/python" && pwd)/clers_decode.py"
+DECODE="$(cd "$ROOT/../clers/bin" && pwd)/clers"
 PRIME="${PRIME_DIR:-$HOME/neo/data/primes}"
 TMP="$ROOT/tmp_closure"
 JOBS=80
 
 [ -x "$PUFFUP" ] || { echo "ERROR: $PUFFUP not found — run: make"; exit 1; }
-[ -f "$DECODE" ] || { echo "ERROR: $DECODE not found"; exit 1; }
+[ -x "$DECODE" ] || { echo "ERROR: $DECODE not found (build clers first)"; exit 1; }
 [ -d "$PRIME"  ] || { echo "ERROR: $PRIME not found (set PRIME_DIR)"; exit 1; }
 
 V1="${1:-4}"
@@ -69,7 +69,7 @@ for v in $(seq "$V1" "$V2"); do
     [ "$nlines" -lt "$shards" ] && shards=$nlines
 
     rm -f "$TMP"/cl_${v}_*
-    $zcat "$src" | python3 "$DECODE" | split -n "l/$shards" - "$TMP/cl_${v}_"
+    $zcat "$src" | "$DECODE" decode | split -n "l/$shards" - "$TMP/cl_${v}_"
 
     nice -n 19 parallel -j "$JOBS" \
         "$PUFFUP < {} > {}.out 2>/dev/null" \
