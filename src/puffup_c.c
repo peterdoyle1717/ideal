@@ -783,6 +783,24 @@ static HomotopyResult homotopy_with(const double bends_init[],
         newton_total += iters;
         if (rc == 0) {
             memcpy(bends_curr, bends_trial, NE*sizeof(double));
+            /* Now solve for the 3 base-edge bends via complete_base_bends's
+               closed-form atan2 imputation, and re-check has_dent on the
+               full bend vector. The Newton above only updated var-edges;
+               the existing has_dent inside try_full_newton couldn't see
+               base-edge bends. Without this, a homotopy that converged on
+               the convex branch for var-edges can still produce a dented
+               polyhedron via a wrap-around base bend (atan2 returns
+               (-π, π], so a "true" bend slightly past π comes back as a
+               very negative value). Failing here triggers the existing
+               retry-with-tighter-params path in homotopy(). */
+            if (complete_base_bends(alpha_curr, bends_curr) < 0) {
+                HomotopyResult R = {1, n_steps, n_halve, newton_total, alpha_curr};
+                return R;
+            }
+            if (has_dent(bends_curr)) {
+                HomotopyResult R = {1, n_steps, n_halve, newton_total, alpha_curr};
+                return R;
+            }
             HomotopyResult R = {0, n_steps, n_halve, newton_total, alpha_curr};
             return R;
         }
@@ -1036,14 +1054,10 @@ int main(int argc, char **argv) {
         int retry_used = 0;
         HomotopyResult r = homotopy(bends_init, &retry_used);
         if (r.status == 0) {
-            /* solve base bends, then optionally reconstruct + write OBJ */
-            if (complete_base_bends(r.final_alpha, bends_curr) < 0) {
-                printf("base_bend_fail %d %d %d %d %.10f %d\n",
-                       NV, r.n_steps, r.n_halve, r.newton_iters,
-                       r.final_alpha * 180.0 / M_PI, retry_used);
-                build_clear();
-                continue;
-            }
+            /* base bends already filled in by homotopy_with's final cleanup
+               (along with a has_dent check on the full bend vector), so
+               bends_curr is the complete, undented solution. Just write OBJ
+               and bends as requested. */
             if (obj_dir) {
                 if (reconstruct(bends_curr) == 0) {
                     char path[1024];
