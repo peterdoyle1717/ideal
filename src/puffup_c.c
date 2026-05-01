@@ -19,12 +19,18 @@
 #include <string.h>
 #include <math.h>
 
+#ifndef MAXV
 #define MAXV    1200      /* room for icosa{5,2}=392 + headroom for bigger subdivisions.
                              Static cost at MAXV=1200 is ~133 MiB:
                              EM/EM_F/EDGE_IDX (3×(MAXV+1)² int) ≈ 16.5 MiB,
                              HJ (MAXV² double)                  ≈ 11 MiB,
                              Jbuf (3·MAXV·MAXN double)          ≈ 99 MiB.
-                             For MAXV ≫ 1200 replace dense tables with hashes. */
+                             Compile with `cc -O3 -DMAXV=N` to override (e.g.
+                             MAXV=2700 for V≈2600 runs at ~670 MiB). For very
+                             large MAXV replace the dense V×V lookup tables
+                             (EM/EM_F/EDGE_IDX) with hash maps and the dense
+                             LU with a sparse factorization. */
+#endif
 #define MAXF    (2*MAXV + 4)
 #define MAXE    (3*MAXV - 6)
 #define MAXRING 16
