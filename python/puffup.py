@@ -318,10 +318,20 @@ class HomotopyOut:
 # ── halfway-to-60 homotopy + auto-retry, mirrors src/puffup_c.c exactly ──
 
 def _try_full_newton(tri: Tri, base_face: Face, alpha: float,
-                      bends_in: Dict[Edge, float], tol: float, max_iter: int):
+                      bends_in: Dict[Edge, float], tol: float, max_iter: int,
+                      use_sparse: bool = False):
     """Full Newton (no λ damping). Returns (status, bends, iters).
-    status ∈ {'ok', 'dented', 'lstsq_fail', 'max_iter'}."""
-    from jacobian import analytical_jacobian   # local import: same dir
+    status ∈ {'ok', 'dented', 'lstsq_fail', 'max_iter'}.
+
+    If use_sparse=True, builds the Jacobian via jacobian_sparse and solves
+    with scipy.sparse.linalg.spsolve. Falls back to dense lstsq on
+    singular factorization, identical to the dense path. The dent-rejection
+    check and the tight-tol caller-driven final solve work the same way."""
+    if use_sparse:
+        from jacobian_sparse import analytical_jacobian_sparse
+        import scipy.sparse.linalg as _spla
+    else:
+        from jacobian import analytical_jacobian   # local import: same dir
     base_edges = [edge_key(base_face[i], base_face[(i+1) % 3]) for i in range(3)]
     var_edges = [e for e in tri.edges if e not in base_edges]
     base_bend = {e: bends_in[e] for e in base_edges}
@@ -338,14 +348,28 @@ def _try_full_newton(tri: Tri, base_face: Face, alpha: float,
         r = F(x)
         if float(np.linalg.norm(r)) <= tol:
             return 'ok', to_b(x), it
-        J = analytical_jacobian(tri, base_face, var_edges, x, base_bend, alpha)
-        try:
-            dx = np.linalg.solve(J, -r)
-        except np.linalg.LinAlgError:
+        if use_sparse:
+            Jsp = analytical_jacobian_sparse(tri, base_face, var_edges, x, base_bend, alpha)
             try:
-                dx, *_ = np.linalg.lstsq(J, -r, rcond=None)
+                dx = _spla.spsolve(Jsp, -r)
+                if not np.all(np.isfinite(dx)):
+                    raise RuntimeError('spsolve gave non-finite result')
+            except Exception:
+                # Singular sparse factorization → fall back to dense lstsq.
+                Jd = Jsp.toarray()
+                try:
+                    dx, *_ = np.linalg.lstsq(Jd, -r, rcond=None)
+                except np.linalg.LinAlgError:
+                    return 'lstsq_fail', to_b(x), it
+        else:
+            J = analytical_jacobian(tri, base_face, var_edges, x, base_bend, alpha)
+            try:
+                dx = np.linalg.solve(J, -r)
             except np.linalg.LinAlgError:
-                return 'lstsq_fail', to_b(x), it
+                try:
+                    dx, *_ = np.linalg.lstsq(J, -r, rcond=None)
+                except np.linalg.LinAlgError:
+                    return 'lstsq_fail', to_b(x), it
         x = x + dx
         if is_dented(to_b(x)):
             return 'dented', to_b(x), it + 1
@@ -353,12 +377,23 @@ def _try_full_newton(tri: Tri, base_face: Face, alpha: float,
 
 
 def homotopy_with(tri: Tri, base_face: Face, bends_init: Dict[Edge, float],
-                   init_step_deg: float, max_newton: int, loose_tol: float):
-    """Halfway-to-60° α-additive homotopy. Halve α_step on dent or
-    max_iter, no growth. Final cleanup at TIGHT_TOL=1e-12.
-    Returns dict with status, n_steps, n_halve, newton_iters,
-    final_alpha (radians), bends."""
-    GOAL = math.pi / 3
+                   init_step_deg: float, max_newton: int, loose_tol: float,
+                   target_alpha_deg: float = 60.0, use_sparse: bool = False):
+    """α-additive homotopy from 0 to target_alpha_deg with halve-on-failure
+    and a halfway step cap. Halve α_step on dent or max_iter, no growth.
+    Final cleanup at TIGHT_TOL=1e-12. Returns dict with status, n_steps,
+    n_halve, newton_iters, final_alpha (radians), bends.
+
+    target_alpha_deg defaults to 60° (the Euclidean limit, what puffup_c
+    targets by default). use_sparse=True switches the inner Newton solve
+    to scipy.sparse.linalg.spsolve via jacobian_sparse — same residuals,
+    same dent rejection, same lstsq fallback on singular factorization,
+    same final tight solve."""
+    if not (0.0 < target_alpha_deg <= 60.0):
+        raise ValueError(
+            f'target_alpha_deg must be in (0, 60]; got {target_alpha_deg!r}. '
+            'The α=0 limit is the ideal-horoball state already provided as bends_init.')
+    GOAL = math.radians(target_alpha_deg)
     ALPHA_FINAL = GOAL * (1 - 1e-12)
     MIN_ALPHA_STEP = 1e-12
     MAX_ATTEMPTS = 8000
@@ -374,7 +409,7 @@ def homotopy_with(tri: Tri, base_face: Face, bends_init: Dict[Edge, float],
         used = min(alpha_step, cap)
         a_try = alpha_curr + used
         st, b_new, iters = _try_full_newton(tri, base_face, a_try, bends,
-                                              loose_tol, max_newton)
+                                              loose_tol, max_newton, use_sparse)
         newton_total += iters
         if st == 'ok':
             bends = b_new
@@ -389,7 +424,7 @@ def homotopy_with(tri: Tri, base_face: Face, bends_init: Dict[Edge, float],
                         'bends': bends}
     if alpha_curr >= ALPHA_FINAL:
         st, b_new, iters = _try_full_newton(tri, base_face, alpha_curr, bends,
-                                              TIGHT_TOL, 30)
+                                              TIGHT_TOL, 30, use_sparse)
         newton_total += iters
         if st == 'ok':
             return {'status': 'ok', 'n_steps': n_steps, 'n_halve': n_halve,
