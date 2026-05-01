@@ -34,7 +34,11 @@
 #define MAXF    (2*MAXV + 4)
 #define MAXE    (3*MAXV - 6)
 #define MAXRING 16
-#define MAXLINE 65536     /* 16K was tight for V > 400 face lists */
+#ifndef MAXLINE
+#define MAXLINE 65536     /* 16K was tight for V > 400 face lists.
+                             Override at compile time, e.g. -DMAXLINE=131072,
+                             when face-list strings exceed 64K (V ≥ 2200ish). */
+#endif
 
 /* number of homotopy variables = non-base bends = E - 3 = 3V-9 */
 #define MAXN    (3*MAXV - 9)
