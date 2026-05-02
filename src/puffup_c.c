@@ -57,11 +57,17 @@
 #define BEND_BOUND    M_PI                  /* canonical (−π, π] for bend = π−interior_dihedral */
 #define BEND_EPS      1e-12                 /* tolerance on the bend bound */
 
-/* Solver path. 0=dense (default), 1=sparse (SuperLU). Set via --solver flag.
- * Sparse path requires build with -DHAVE_SUPERLU and link to SuperLU. */
+/* Solver path. Set via --solver flag. The default flips based on the build:
+ * with HAVE_SUPERLU the sparse path is the default (it's O(V^1.5) vs the
+ * dense path's O(V³)); the dense path stays available as `--solver dense`.
+ * Without HAVE_SUPERLU, dense is the only path. */
 #define SOLVER_DENSE  0
 #define SOLVER_SPARSE 1
+#ifdef HAVE_SUPERLU
+static int    CFG_SOLVER = SOLVER_SPARSE;
+#else
 static int    CFG_SOLVER = SOLVER_DENSE;
+#endif
 
 /* ---------- graph state ---------------------------------------------------- */
 typedef struct { int a, b, c; } Face;
@@ -726,11 +732,11 @@ static int has_dent_full(const double bend[]) {
  * cache (A_colptr, A_rowidx) once per case + the column ordering perm_c,
  * and refill A_val per Newton iter.
  *
- * Per-iter the sparse path skips the O(V²) dense-LU work entirely, but the
- * static `Jbuf[3*MAXV*MAXN]` allocation at the top of the file is unchanged
- * — both solver paths share the same source and Jbuf is reachable from the
- * dense path even when --solver sparse is selected at runtime. The win is
- * Newton-iter time (10–100× at V > 1000), not static memory.
+ * Per-iter the sparse path skips the O(V²) dense-LU work entirely. Jbuf
+ * itself is now a dynamic allocation gated on CFG_SOLVER == DENSE (see
+ * dense_jbuf_alloc), so a sparse run also doesn't pay the dense Jbuf
+ * memory cost. The remaining static cost shared by both paths is
+ * O(V·MAXRING) (FLOWER, V_EDGE, etc.).
  *
  * Math is identical to `analytical_jacobian` (and `python/jacobian_sparse.py`):
  * sparse_jacobian_fill calls the same `vertex_flower_prefixes` +
@@ -1296,9 +1302,12 @@ int main(int argc, char **argv) {
      *   --bends-out DIR      write per-edge bends to DIR/<n>.bends
      *                        (consumed by realize_c for Klein OBJ output)
      *   --trace              log per-α-step max bend change to stderr
-     *   --solver dense|sparse pick LU implementation (default dense; sparse
-     *                        requires build with -DHAVE_SUPERLU + SuperLU
-     *                        link, and is O(V^1.5) instead of O(V^3))
+     *   --solver dense|sparse pick LU implementation. Default flips with
+     *                        the build: with -DHAVE_SUPERLU + SuperLU link,
+     *                        defaults to sparse (O(V^1.5)); without it,
+     *                        defaults to dense (O(V^3)). --solver dense
+     *                        always works; --solver sparse requires the
+     *                        SuperLU build.
      */
     const char *obj_dir = NULL;
     const char *bends_dir = NULL;

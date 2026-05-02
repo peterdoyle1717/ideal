@@ -29,7 +29,8 @@ src/puffup_c: src/puffup_c.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 # Sparse-LU variant: same source, built with -DHAVE_SUPERLU and linked to
-# SuperLU + BLAS. Use ./puffup_c_sparse --solver sparse to engage.
+# SuperLU + BLAS. With this build, sparse is the default solver; pass
+# --solver dense to fall back to the dense path for A/B comparison.
 src/puffup_c_sparse: src/puffup_c.c
 	$(CC) $(CFLAGS) -DHAVE_SUPERLU $(SUPERLU_INC) -o $@ $< $(SUPERLU_LIB) -lm
 
