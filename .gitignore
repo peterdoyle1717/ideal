@@ -13,3 +13,4 @@ __pycache__/
 .DS_Store
 src/puffup_c
 src/realize_c
+src/embed_check
