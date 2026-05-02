@@ -43,6 +43,17 @@
 /* number of homotopy variables = non-base bends = E - 3 = 3V-9 */
 #define MAXN    (3*MAXV - 9)
 
+/* ---------- solver hardening (2026-05-02) -------------------------------- *
+ * Per-Newton-step bend-change cap: scale dx uniformly so max|dx[i]| ≤ 5°.
+ * Hard bend bound: every var-edge bend lies in (−π−ε, π+ε], else reject the
+ * step (status code 4) → triggers alpha_step *= 0.5 retry.
+ * In-loop has_dent skips BASE_VS; post-homotopy has_dent_full checks all
+ * vertices (after complete_base_bends has imputed the 3 base bends).
+ * Acceptance gate: external dent_check on the realized OBJ. */
+#define MAX_DX_CAP    0.08726646259971647   /* 5° */
+#define BEND_BOUND    M_PI                  /* canonical (−π, π] for bend = π−interior_dihedral */
+#define BEND_EPS      1e-12                 /* tolerance on the bend bound */
+
 /* ---------- graph state ---------------------------------------------------- */
 typedef struct { int a, b, c; } Face;
 
@@ -612,19 +623,40 @@ static void analytical_jacobian(double alpha, const double bend[]) {
 
 /* ---------- Newton with dent check ---------------------------------------- */
 /* dent at vertex v: sum of bends on incident edges (in flower order) < 0. */
-static int has_dent(const double bend[]) {
-    /* for each vertex sum bends on its flower edges */
+static int has_dent_at(int v, const double bend[]) {
+    int k = FLOWER_LEN[v];
+    double s = 0.0;
+    for (int t = 0; t < k; t++) s += bend[FLOWER_E[v][t]];
+    return s < 0.0;
+}
+
+/* In-loop (during homotopy) dent check.
+ * Skips BASE_VS: the 3 base edges are frozen at their α=0 ideal-limit
+ * values during homotopy, and the sum-of-bends at a base vertex is
+ * dominated by those frozen contributions. The check is misleading there
+ * (a wrong-branch var-edge can be masked by the frozen +218°). At base
+ * vertices of degree ≥ 5 the check is non-vacuous in principle, but the
+ * relevant signal is captured by the post-homotopy has_dent_full and by
+ * the external dent_check (link-turning) acceptance gate. */
+static int has_dent_inloop(const double bend[]) {
     for (int v = 1; v <= NV; v++) {
-        int k = FLOWER_LEN[v];
-        double s = 0.0;
-        for (int t = 0; t < k; t++) s += bend[FLOWER_E[v][t]];
-        if (s < 0.0) return 1;
+        if (v == BASE_VS[0] || v == BASE_VS[1] || v == BASE_VS[2]) continue;
+        if (has_dent_at(v, bend)) return 1;
+    }
+    return 0;
+}
+
+/* Post-homotopy dent check. Caller must invoke complete_base_bends first
+ * so the 3 base-edge bends carry imputed values. */
+static int has_dent_full(const double bend[]) {
+    for (int v = 1; v <= NV; v++) {
+        if (has_dent_at(v, bend)) return 1;
     }
     return 0;
 }
 
 /* Try to solve at α from bend_in. Updates bend_out (with var-edges replaced).
-   Returns: 0=ok, 1=dented, 2=lstsq_fail, 3=max_iter. */
+   Returns: 0=ok, 1=dented, 2=lstsq_fail, 3=max_iter, 4=bend_oob. */
 static double rvec[3*MAXV];
 static double dxvec[MAXN];
 
@@ -646,14 +678,32 @@ static int try_full_newton(double alpha, const double bend_in[],
             *iters_used = it + 1;
             return 2;
         }
-        /* full step */
+        /* Direction-preserving Newton step cap: scale dx so max|dx[i]| ≤
+         * MAX_DX_CAP. Catches Newton overshoot that would push a bend across
+         * a branch boundary in one iteration. */
+        double mxdx = 0.0;
+        for (int i = 0; i < NVAR; i++) {
+            double a = fabs(dxvec[i]);
+            if (a > mxdx) mxdx = a;
+        }
+        if (mxdx > MAX_DX_CAP) {
+            double scale = MAX_DX_CAP / mxdx;
+            for (int i = 0; i < NVAR; i++) dxvec[i] *= scale;
+        }
+        /* Apply step + check bend bound. Each var-edge bend must remain in
+         * (−π−ε, π+ε]; on violation, return status 4 → caller halves α. */
         for (int i = 0; i < NE; i++) {
             if (VAR_OF_EDGE[i] >= 0) {
-                bend_out[i] += dxvec[VAR_OF_EDGE[i]];
+                double bnew = bend_out[i] + dxvec[VAR_OF_EDGE[i]];
+                if (bnew <= -BEND_BOUND - BEND_EPS ||
+                    bnew  >  BEND_BOUND + BEND_EPS) {
+                    *iters_used = it + 1;
+                    return 4;
+                }
+                bend_out[i] = bnew;
             }
         }
-        /* dent check on new x */
-        if (has_dent(bend_out)) { *iters_used = it + 1; return 1; }
+        if (has_dent_inloop(bend_out)) { *iters_used = it + 1; return 1; }
     }
     *iters_used = max_iter;
     return 3;
@@ -719,6 +769,7 @@ typedef struct {
 
 static double bends_curr[MAXE];
 static double bends_trial[MAXE];
+static double bends_snap[MAXE];   /* snapshot before each α-step (--trace) */
 
 /* Default homotopy params (override via CLI flags from main). */
 static double CFG_LOOSE_TOL           = 1e-3;
@@ -734,6 +785,9 @@ static double CFG_RETRY_INIT_DEG      = 0.25;
    values produce a hyperbolic realization with equilateral side
    length s = arccosh(cos α / (1 − cos α)). */
 static double CFG_TARGET_ALPHA_DEG    = 60.0;
+
+/* If set via --trace, log per-α-step max bend change to stderr. */
+static int    CFG_TRACE = 0;
 
 static HomotopyResult homotopy_with(const double bends_init[],
                                      double init_step_deg, int max_newton_iters,
@@ -759,10 +813,24 @@ static HomotopyResult homotopy_with(const double bends_init[],
         double alpha_try = alpha_curr + used;
 
         int iters;
+        if (CFG_TRACE) memcpy(bends_snap, bends_curr, NE*sizeof(double));
         int rc = try_full_newton(alpha_try, bends_curr, bends_trial,
                                   MAX_NEWTON_ITERS, LOOSE_TOL, &iters);
         newton_total += iters;
         if (rc == 0) {
+            if (CFG_TRACE) {
+                double mxd = 0.0;
+                for (int i = 0; i < NE; i++) {
+                    if (VAR_OF_EDGE[i] >= 0) {
+                        double d = fabs(bends_trial[i] - bends_snap[i]);
+                        if (d > mxd) mxd = d;
+                    }
+                }
+                fprintf(stderr,
+                    "STEP α=%.4f° → %.4f°  max_dbend=%.3f°  iters=%d\n",
+                    alpha_curr*180.0/M_PI, alpha_try*180.0/M_PI,
+                    mxd*180.0/M_PI, iters);
+            }
             memcpy(bends_curr, bends_trial, NE*sizeof(double));
             alpha_curr = alpha_try;
             n_steps++;
@@ -783,21 +851,15 @@ static HomotopyResult homotopy_with(const double bends_init[],
         newton_total += iters;
         if (rc == 0) {
             memcpy(bends_curr, bends_trial, NE*sizeof(double));
-            /* Now solve for the 3 base-edge bends via complete_base_bends's
-               closed-form atan2 imputation, and re-check has_dent on the
-               full bend vector. The Newton above only updated var-edges;
-               the existing has_dent inside try_full_newton couldn't see
-               base-edge bends. Without this, a homotopy that converged on
-               the convex branch for var-edges can still produce a dented
-               polyhedron via a wrap-around base bend (atan2 returns
-               (-π, π], so a "true" bend slightly past π comes back as a
-               very negative value). Failing here triggers the existing
-               retry-with-tighter-params path in homotopy(). */
+            /* Impute the 3 base-edge bends via the atan2 closed form, then
+               run has_dent_full (every vertex including base) on the
+               complete bend vector. The in-loop check skips base vertices,
+               so this is the first time their sums get scrutinized. */
             if (complete_base_bends(alpha_curr, bends_curr) < 0) {
                 HomotopyResult R = {1, n_steps, n_halve, newton_total, alpha_curr};
                 return R;
             }
-            if (has_dent(bends_curr)) {
+            if (has_dent_full(bends_curr)) {
                 HomotopyResult R = {1, n_steps, n_halve, newton_total, alpha_curr};
                 return R;
             }
@@ -977,12 +1039,17 @@ int main(int argc, char **argv) {
      *   --target-alpha-deg N halt homotopy at α = N° (default 60)
      *   --bends-out DIR      write per-edge bends to DIR/<n>.bends
      *                        (consumed by realize_c for Klein OBJ output)
+     *   --trace              log per-α-step max bend change to stderr
      */
     const char *obj_dir = NULL;
     const char *bends_dir = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--no-retry")) {
             CFG_RETRY_TOL = -1.0;   /* sentinel: skip retry */
+            continue;
+        }
+        if (!strcmp(argv[i], "--trace")) {
+            CFG_TRACE = 1;
             continue;
         }
         if (i >= argc - 1) break;
