@@ -3,9 +3,14 @@
  * C port of prove_float.py. Uses IEEE 754 double precision with
  * rigorous error tracking. Requires LAPACK for SVD (dgesvd).
  *
+ * Embeddedness of the input OBJ is a precondition, enforced
+ * externally by src/embed_check (CGAL exact predicates) at the
+ * prover boundary. This file does NOT do its own tri-tri test;
+ * the previous Möller-based check 0b had false positives and was
+ * redundant with the certified external gate.
+ *
  * Checks:
  *   0. Undented (all vertex turning sums > 0)
- *   0b. Embedded (no triangle-triangle intersections)
  *   1. 3|V| >= |E|
  *   2. Collision distance CD > 0
  *   3. sigma_min > 0 and rho < sigma_min^2 / (16*sqrt(E))
@@ -117,89 +122,6 @@ static double compute_undented(void){
         if(tv<min_t) min_t=tv;
     }
     return min_t;
-}
-
-/* ── Check 0b: embedded (triangle-triangle intersection) ─────────────── */
-static int tri_tri_intersect(int fi, int fj){
-    double p0x=vx[fa[fi]],p0y=vy[fa[fi]],p0z=vz[fa[fi]];
-    double p1x=vx[fb[fi]],p1y=vy[fb[fi]],p1z=vz[fb[fi]];
-    double p2x=vx[fc[fi]],p2y=vy[fc[fi]],p2z=vz[fc[fi]];
-    double q0x=vx[fa[fj]],q0y=vy[fa[fj]],q0z=vz[fa[fj]];
-    double q1x=vx[fb[fj]],q1y=vy[fb[fj]],q1z=vz[fb[fj]];
-    double q2x=vx[fc[fj]],q2y=vy[fc[fj]],q2z=vz[fc[fj]];
-    /* plane of tri 1 */
-    double e1x=p1x-p0x,e1y=p1y-p0y,e1z=p1z-p0z;
-    double e2x=p2x-p0x,e2y=p2y-p0y,e2z=p2z-p0z;
-    double n1x=e1y*e2z-e1z*e2y,n1y=e1z*e2x-e1x*e2z,n1z=e1x*e2y-e1y*e2x;
-    double d1=-(n1x*p0x+n1y*p0y+n1z*p0z);
-    double dq0=n1x*q0x+n1y*q0y+n1z*q0z+d1;
-    double dq1=n1x*q1x+n1y*q1y+n1z*q1z+d1;
-    double dq2=n1x*q2x+n1y*q2y+n1z*q2z+d1;
-    if(dq0*dq1>0&&dq0*dq2>0) return 0;
-    /* plane of tri 2 */
-    double f1x=q1x-q0x,f1y=q1y-q0y,f1z=q1z-q0z;
-    double f2x=q2x-q0x,f2y=q2y-q0y,f2z=q2z-q0z;
-    double n2x=f1y*f2z-f1z*f2y,n2y=f1z*f2x-f1x*f2z,n2z=f1x*f2y-f1y*f2x;
-    double d2=-(n2x*q0x+n2y*q0y+n2z*q0z);
-    double dp0=n2x*p0x+n2y*p0y+n2z*p0z+d2;
-    double dp1=n2x*p1x+n2y*p1y+n2z*p1z+d2;
-    double dp2=n2x*p2x+n2y*p2y+n2z*p2z+d2;
-    if(dp0*dp1>0&&dp0*dp2>0) return 0;
-    /* coplanar check */
-    double nn1=sqrt(n1x*n1x+n1y*n1y+n1z*n1z);
-    double nn2=sqrt(n2x*n2x+n2y*n2y+n2z*n2z);
-    if(nn1<1e-30||nn2<1e-30) return 0;
-    double Dx=n1y*n2z-n1z*n2y,Dy=n1z*n2x-n1x*n2z,Dz=n1x*n2y-n1y*n2x;
-    double Dn=sqrt(Dx*Dx+Dy*Dy+Dz*Dz);
-    if(Dn<1e-30) return 0; /* coplanar */
-    /* project */
-    int ax=0; double am=fabs(Dx);
-    if(fabs(Dy)>am){ax=1;am=fabs(Dy);} if(fabs(Dz)>am) ax=2;
-    double pp[3],qq[3],dp[3],dq[3];
-    double pv[3][3]={{p0x,p0y,p0z},{p1x,p1y,p1z},{p2x,p2y,p2z}};
-    double qv[3][3]={{q0x,q0y,q0z},{q1x,q1y,q1z},{q2x,q2y,q2z}};
-    for(int i=0;i<3;i++){pp[i]=pv[i][ax];qq[i]=qv[i][ax];}
-    dp[0]=dp0;dp[1]=dp1;dp[2]=dp2;
-    dq[0]=dq0;dq[1]=dq1;dq[2]=dq2;
-    double eps=1e-12*(nn1>nn2?nn1:nn2);
-    if(fabs(dp[0])<eps&&fabs(dp[1])<eps&&fabs(dp[2])<eps) return 0;
-    if(fabs(dq[0])<eps&&fabs(dq[1])<eps&&fabs(dq[2])<eps) return 0;
-    /* sign check */
-    double sp[3],sq[3];
-    for(int i=0;i<3;i++){sp[i]=(fabs(dp[i])<eps)?0:(dp[i]>0?1:-1);sq[i]=(fabs(dq[i])<eps)?0:(dq[i]>0?1:-1);}
-    if((sp[0]>=0&&sp[1]>=0&&sp[2]>=0)||(sp[0]<=0&&sp[1]<=0&&sp[2]<=0)) return 0;
-    if((sq[0]>=0&&sq[1]>=0&&sq[2]>=0)||(sq[0]<=0&&sq[1]<=0&&sq[2]<=0)) return 0;
-    /* intervals */
-    int lone_p,pa0,pa1, lone_q,qa0,qa1;
-    if(sp[0]*sp[1]>0||(sp[0]==0&&sp[1]==0)){lone_p=2;pa0=0;pa1=1;}
-    else if(sp[0]*sp[2]>0||(sp[0]==0&&sp[2]==0)){lone_p=1;pa0=0;pa1=2;}
-    else{lone_p=0;pa0=1;pa1=2;}
-    if(sq[0]*sq[1]>0||(sq[0]==0&&sq[1]==0)){lone_q=2;qa0=0;qa1=1;}
-    else if(sq[0]*sq[2]>0||(sq[0]==0&&sq[2]==0)){lone_q=1;qa0=0;qa1=2;}
-    else{lone_q=0;qa0=1;qa1=2;}
-    double t0p=pp[pa0]+(pp[lone_p]-pp[pa0])*dp[pa0]/(dp[pa0]-dp[lone_p]);
-    double t1p=pp[pa1]+(pp[lone_p]-pp[pa1])*dp[pa1]/(dp[pa1]-dp[lone_p]);
-    if(t0p>t1p){double t=t0p;t0p=t1p;t1p=t;}
-    double t0q=qq[qa0]+(qq[lone_q]-qq[qa0])*dq[qa0]/(dq[qa0]-dq[lone_q]);
-    double t1q=qq[qa1]+(qq[lone_q]-qq[qa1])*dq[qa1]/(dq[qa1]-dq[lone_q]);
-    if(t0q>t1q){double t=t0q;t0q=t1q;t1q=t;}
-    double overlap=(t1p<t1q?t1p:t1q)-(t0p>t0q?t0p:t0q);
-    return overlap>eps;
-}
-
-static int check_embedded(int *n_bad_out){
-    int n_bad=0;
-    for(int i=0;i<nf;i++) for(int j=i+1;j<nf;j++){
-        int a=fa[i],b=fb[i],c=fc[i],d=fa[j],e=fb[j],f=fc[j];
-        int shared=0;
-        if(a==d||a==e||a==f) shared++;
-        if(b==d||b==e||b==f) shared++;
-        if(c==d||c==e||c==f) shared++;
-        if(shared>=2) continue;
-        if(tri_tri_intersect(i,j)) n_bad++;
-    }
-    *n_bad_out=n_bad;
-    return n_bad==0;
 }
 
 /* ── Check 2: collision distance ─────────────────────────────────────── */
@@ -361,12 +283,7 @@ static int prove(const char *name, char *msg, int msglen){
         snprintf(msg,msglen,"Failed: dented (min_turn=%.6e)",min_turn);
         return 0;
     }
-    /* Check 0b: embedded */
-    int n_bad;
-    if(!check_embedded(&n_bad)){
-        snprintf(msg,msglen,"Failed: self-intersecting (%d pairs)",n_bad);
-        return 0;
-    }
+    /* Embeddedness is a precondition; checked externally by embed_check. */
     /* Inequality 1: 3V >= E */
     if(3*nv<ne){
         snprintf(msg,msglen,"Failed: 3V=%d < E=%d",3*nv,ne);
