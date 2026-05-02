@@ -19,6 +19,10 @@
 #include <string.h>
 #include <math.h>
 
+#ifdef HAVE_SUPERLU
+#include <slu_ddefs.h>
+#endif
+
 #ifndef MAXV
 #define MAXV    1200      /* room for icosa{5,2}=392 + headroom for bigger subdivisions.
                              Static cost at MAXV=1200 is ~133 MiB:
@@ -53,6 +57,12 @@
 #define MAX_DX_CAP    0.08726646259971647   /* 5° */
 #define BEND_BOUND    M_PI                  /* canonical (−π, π] for bend = π−interior_dihedral */
 #define BEND_EPS      1e-12                 /* tolerance on the bend bound */
+
+/* Solver path. 0=dense (default), 1=sparse (SuperLU). Set via --solver flag.
+ * Sparse path requires build with -DHAVE_SUPERLU and link to SuperLU. */
+#define SOLVER_DENSE  0
+#define SOLVER_SPARSE 1
+static int    CFG_SOLVER = SOLVER_DENSE;
 
 /* ---------- graph state ---------------------------------------------------- */
 typedef struct { int a, b, c; } Face;
@@ -584,39 +594,53 @@ static void holonomy_residual(double alpha, const double bend[], double r[]) {
 /* Build analytical Jacobian J[3*N_INT][NVAR] (row-major, stride NVAR). */
 static double Jbuf[3*MAXV * MAXN];
 
+/* Compute per-vertex flower products: Ms[t]=movemat(α,bend[e_t]), P[t]=∏_{s<t}Ms[s],
+ * S[t]=∏_{s≥t}Ms[s]. Shared between dense `analytical_jacobian` and sparse
+ * `sparse_jacobian_fill` so both paths emit identical entries. */
+static void vertex_flower_prefixes(int v, double alpha, const double bend[],
+                                    int *k_out, M3 *Ms, M3 *P, M3 *S) {
+    int k = FLOWER_LEN[v];
+    *k_out = k;
+    for (int t = 0; t < k; t++) movemat(alpha, bend[FLOWER_E[v][t]], Ms[t]);
+    mat_eye(P[0]);
+    for (int t = 0; t < k; t++) matmul(P[t], Ms[t], P[t+1]);
+    mat_eye(S[k]);
+    for (int t = k-1; t >= 0; t--) matmul(Ms[t], S[t+1], S[t]);
+}
+
+/* Compute the 3 off-diagonal contrib values from
+ *   P_t · (dM/dβ at α, bend[e]) · S_{t+1}
+ * to be deposited at rows 3i+0,1,2 of column VAR_OF_EDGE[e]. */
+static void jac_contrib_at(double alpha, double beta_e,
+                            const M3 P_t, const M3 S_tnext,
+                            double *v01, double *v02, double *v12) {
+    M3 dM, tmp, contrib;
+    dmovemat_dbeta(alpha, beta_e, dM);
+    matmul(P_t, dM, tmp);
+    matmul(tmp, S_tnext, contrib);
+    *v01 = contrib[0][1];
+    *v02 = contrib[0][2];
+    *v12 = contrib[1][2];
+}
+
 static void analytical_jacobian(double alpha, const double bend[]) {
     int rows = 3 * N_INT;
     memset(Jbuf, 0, rows * NVAR * sizeof(double));
-
+    M3 Ms[MAXRING], P[MAXRING+1], S[MAXRING+1];
     for (int i = 0; i < N_INT; i++) {
         int v = INT_VS[i];
-        int k = FLOWER_LEN[v];
-        /* per-step movemats */
-        M3 Ms[MAXRING];
-        for (int t = 0; t < k; t++) {
-            movemat(alpha, bend[FLOWER_E[v][t]], Ms[t]);
-        }
-        /* prefix products P[0]=I, P[t] = M_0 ... M_{t-1} */
-        M3 P[MAXRING+1];
-        mat_eye(P[0]);
-        for (int t = 0; t < k; t++) matmul(P[t], Ms[t], P[t+1]);
-        /* suffix products S[k]=I, S[t] = M_t ... M_{k-1} */
-        M3 S[MAXRING+1];
-        mat_eye(S[k]);
-        for (int t = k-1; t >= 0; t--) matmul(Ms[t], S[t+1], S[t]);
-
+        int k;
+        vertex_flower_prefixes(v, alpha, bend, &k, Ms, P, S);
         for (int t = 0; t < k; t++) {
             int e = FLOWER_E[v][t];
             int col = VAR_OF_EDGE[e];
-            if (col < 0) continue;  /* base edge — skip */
-            M3 dM, tmp, contrib;
-            dmovemat_dbeta(alpha, bend[e], dM);
-            matmul(P[t], dM, tmp);
-            matmul(tmp, S[t+1], contrib);
+            if (col < 0) continue;
+            double v01, v02, v12;
+            jac_contrib_at(alpha, bend[e], P[t], S[t+1], &v01, &v02, &v12);
             int row = 3 * i;
-            Jbuf[(row+0)*NVAR + col] += contrib[0][1];
-            Jbuf[(row+1)*NVAR + col] += contrib[0][2];
-            Jbuf[(row+2)*NVAR + col] += contrib[1][2];
+            Jbuf[(row+0)*NVAR + col] += v01;
+            Jbuf[(row+1)*NVAR + col] += v02;
+            Jbuf[(row+2)*NVAR + col] += v12;
         }
     }
 }
@@ -655,6 +679,184 @@ static int has_dent_full(const double bend[]) {
     return 0;
 }
 
+/* ---------- sparse path (SuperLU) -----------------------------------------
+ * The Jacobian J is square, NRES = 3·N_INT = NVAR = 3V−9, and structurally
+ * sparse: each row has nonzeros only on the var-edges in the corresponding
+ * vertex's flower (~6 NNZ/row). Pattern is fixed across the homotopy. We
+ * cache (A_colptr, A_rowidx) once per case + the column ordering perm_c,
+ * and refill A_val per Newton iter.
+ *
+ * Per-iter the sparse path skips the O(V²) dense-LU work entirely, but the
+ * static `Jbuf[3*MAXV*MAXN]` allocation at the top of the file is unchanged
+ * — both solver paths share the same source and Jbuf is reachable from the
+ * dense path even when --solver sparse is selected at runtime. The win is
+ * Newton-iter time (10–100× at V > 1000), not static memory.
+ *
+ * Math is identical to `analytical_jacobian` (and `python/jacobian_sparse.py`):
+ * sparse_jacobian_fill calls the same `vertex_flower_prefixes` +
+ * `jac_contrib_at` helpers, only the destination of the 3 doubles per
+ * (vertex, flower-position) differs.
+ *
+ * Aliasing note: dCreate_CompCol_Matrix wraps user-owned S_val/S_rowidx/S_colptr
+ * into a SuperMatrix; we destroy with Destroy_SuperMatrix_Store (frees the
+ * wrapper but not our arrays). L and U returned from dgssv are SuperLU-owned;
+ * destroy with Destroy_SuperNode_Matrix and Destroy_CompCol_Matrix. */
+#ifdef HAVE_SUPERLU
+static int_t   *S_colptr = NULL;        /* size NVAR+1 */
+static int_t   *S_rowidx = NULL;        /* size A_NNZ */
+static double  *S_val    = NULL;        /* size A_NNZ */
+static int_t    S_NNZ    = 0;
+static int     *S_perm_c = NULL;        /* size NVAR */
+static int     *S_perm_r = NULL;        /* size NVAR */
+/* Per (interior vertex i, flower position t with var-edge): offset into S_val
+ * for the 3 nonzeros at rows 3i+0,1,2. -1 if base edge. */
+static int_t   *S_off    = NULL;        /* size N_INT * MAXRING */
+
+static void sparse_free(void) {
+    free(S_colptr); S_colptr = NULL;
+    free(S_rowidx); S_rowidx = NULL;
+    free(S_val);    S_val = NULL;
+    free(S_off);    S_off = NULL;
+    if (S_perm_c) { SUPERLU_FREE(S_perm_c); S_perm_c = NULL; }
+    if (S_perm_r) { SUPERLU_FREE(S_perm_r); S_perm_r = NULL; }
+    S_NNZ = 0;
+}
+
+/* Compute the CSC pattern (S_colptr, S_rowidx, S_off) and cache the column
+ * ordering. Call once per case, after choose_base_face(). */
+static int sparse_setup(void) {
+    sparse_free();
+    if (3 * N_INT != NVAR) {
+        fprintf(stderr, "ERROR: square-system invariant violated: 3*N_INT=%d != NVAR=%d\n",
+                3*N_INT, NVAR);
+        return -1;
+    }
+    /* Pass 1: count NNZ per column. */
+    int_t *col_count = calloc((size_t)NVAR, sizeof(int_t));
+    if (!col_count) return -1;
+    for (int i = 0; i < N_INT; i++) {
+        int v = INT_VS[i];
+        int k = FLOWER_LEN[v];
+        for (int t = 0; t < k; t++) {
+            int e = FLOWER_E[v][t];
+            int col = VAR_OF_EDGE[e];
+            if (col < 0) continue;
+            col_count[col] += 3;
+        }
+    }
+    /* Build S_colptr from prefix sum. */
+    S_colptr = malloc((size_t)(NVAR+1) * sizeof(int_t));
+    if (!S_colptr) { free(col_count); return -1; }
+    S_colptr[0] = 0;
+    for (int c = 0; c < NVAR; c++) S_colptr[c+1] = S_colptr[c] + col_count[c];
+    S_NNZ = S_colptr[NVAR];
+
+    S_rowidx = malloc((size_t)S_NNZ * sizeof(int_t));
+    S_val    = malloc((size_t)S_NNZ * sizeof(double));
+    S_off    = malloc((size_t)N_INT * MAXRING * sizeof(int_t));
+    if (!S_rowidx || !S_val || !S_off) { free(col_count); sparse_free(); return -1; }
+
+    /* Pass 2: fill S_rowidx and S_off. col_pos[c] tracks insertion position. */
+    int_t *col_pos = malloc((size_t)NVAR * sizeof(int_t));
+    if (!col_pos) { free(col_count); sparse_free(); return -1; }
+    memcpy(col_pos, S_colptr, (size_t)NVAR * sizeof(int_t));
+
+    for (int i = 0; i < N_INT * MAXRING; i++) S_off[i] = -1;
+    for (int i = 0; i < N_INT; i++) {
+        int v = INT_VS[i];
+        int k = FLOWER_LEN[v];
+        for (int t = 0; t < k; t++) {
+            int e = FLOWER_E[v][t];
+            int col = VAR_OF_EDGE[e];
+            if (col < 0) continue;
+            int_t pos = col_pos[col];
+            S_rowidx[pos+0] = 3*i + 0;
+            S_rowidx[pos+1] = 3*i + 1;
+            S_rowidx[pos+2] = 3*i + 2;
+            S_off[i*MAXRING + t] = pos;
+            col_pos[col] += 3;
+        }
+    }
+    free(col_pos);
+    free(col_count);
+
+    /* Compute column ordering once, on the pattern (values irrelevant). */
+    for (int_t i = 0; i < S_NNZ; i++) S_val[i] = 1.0;
+    SuperMatrix Apat;
+    dCreate_CompCol_Matrix(&Apat, NVAR, NVAR, S_NNZ,
+                            S_val, S_rowidx, S_colptr,
+                            SLU_NC, SLU_D, SLU_GE);
+    S_perm_c = intMalloc(NVAR);
+    S_perm_r = intMalloc(NVAR);
+    if (!S_perm_c || !S_perm_r) {
+        Destroy_SuperMatrix_Store(&Apat);
+        sparse_free();
+        return -1;
+    }
+    /* COLAMD = 1; MMD_ATA = 2; MMD_AT_PLUS_A = 3. COLAMD is right for unsymmetric. */
+    get_perm_c(1, &Apat, S_perm_c);
+    Destroy_SuperMatrix_Store(&Apat);
+    return 0;
+}
+
+/* Recompute the numeric values S_val from current bends; pattern is fixed.
+ * Uses the same `vertex_flower_prefixes` + `jac_contrib_at` helpers as the
+ * dense `analytical_jacobian` so both paths share the Jacobian math. */
+static void sparse_jacobian_fill(double alpha, const double bend[]) {
+    M3 Ms[MAXRING], P[MAXRING+1], S[MAXRING+1];
+    for (int i = 0; i < N_INT; i++) {
+        int v = INT_VS[i];
+        int k;
+        vertex_flower_prefixes(v, alpha, bend, &k, Ms, P, S);
+        for (int t = 0; t < k; t++) {
+            int_t off = S_off[i*MAXRING + t];
+            if (off < 0) continue;
+            int e = FLOWER_E[v][t];
+            double v01, v02, v12;
+            jac_contrib_at(alpha, bend[e], P[t], S[t+1], &v01, &v02, &v12);
+            S_val[off+0] = v01;
+            S_val[off+1] = v02;
+            S_val[off+2] = v12;
+        }
+    }
+}
+
+/* Solve J · dx = -r in place: rhs is dxvec on entry (= -r), dxvec on exit (= dx).
+ * Returns 0 on success, nonzero (singular factorization etc.) on failure.
+ *
+ * L and U are zero-initialized so that on early dgssv failure (before they're
+ * populated) the post-call destroys see Store==NULL and skip — calling
+ * Destroy_SuperNode_Matrix on a stack-uninitialized SuperMatrix would free
+ * garbage. */
+static int sparse_solve(double *rhs) {
+    SuperMatrix A, B;
+    SuperMatrix L = {0};
+    SuperMatrix U = {0};
+    dCreate_CompCol_Matrix(&A, NVAR, NVAR, S_NNZ,
+                            S_val, S_rowidx, S_colptr,
+                            SLU_NC, SLU_D, SLU_GE);
+    dCreate_Dense_Matrix(&B, NVAR, 1, rhs, NVAR, SLU_DN, SLU_D, SLU_GE);
+
+    superlu_options_t options;
+    set_default_options(&options);
+    options.ColPerm = MY_PERMC;          /* use our cached S_perm_c */
+    SuperLUStat_t stat;
+    StatInit(&stat);
+
+    int_t info = 0;
+    dgssv(&options, &A, S_perm_c, S_perm_r, &L, &U, &B, &stat, &info);
+
+    /* Solution is in rhs (B aliases rhs storage). */
+    Destroy_SuperMatrix_Store(&A);
+    Destroy_SuperMatrix_Store(&B);
+    /* Only destroy L, U if dgssv populated them (Store set). */
+    if (L.Store) Destroy_SuperNode_Matrix(&L);
+    if (U.Store) Destroy_CompCol_Matrix(&U);
+    StatFree(&stat);
+    return (int)info;
+}
+#endif  /* HAVE_SUPERLU */
+
 /* Try to solve at α from bend_in. Updates bend_out (with var-edges replaced).
    Returns: 0=ok, 1=dented, 2=lstsq_fail, 3=max_iter, 4=bend_oob. */
 static double rvec[3*MAXV];
@@ -672,11 +874,25 @@ static int try_full_newton(double alpha, const double bend_in[],
         for (int i = 0; i < 3*N_INT; i++) norm2 += rvec[i]*rvec[i];
         if (sqrt(norm2) <= tol) { *iters_used = it; return 0; }
 
-        analytical_jacobian(alpha, bend_out);
         for (int i = 0; i < 3*N_INT; i++) dxvec[i] = -rvec[i];
-        if (lu_solve(Jbuf, dxvec, NVAR, NVAR) < 0) {
+        if (CFG_SOLVER == SOLVER_DENSE) {
+            analytical_jacobian(alpha, bend_out);
+            if (lu_solve(Jbuf, dxvec, NVAR, NVAR) < 0) {
+                *iters_used = it + 1;
+                return 2;
+            }
+        } else {
+#ifdef HAVE_SUPERLU
+            sparse_jacobian_fill(alpha, bend_out);
+            if (sparse_solve(dxvec) != 0) {
+                *iters_used = it + 1;
+                return 2;
+            }
+#else
+            fprintf(stderr, "ERROR: --solver sparse requires build with -DHAVE_SUPERLU\n");
             *iters_used = it + 1;
             return 2;
+#endif
         }
         /* Direction-preserving Newton step cap: scale dx so max|dx[i]| ≤
          * MAX_DX_CAP. Catches Newton overshoot that would push a bend across
@@ -1040,6 +1256,9 @@ int main(int argc, char **argv) {
      *   --bends-out DIR      write per-edge bends to DIR/<n>.bends
      *                        (consumed by realize_c for Klein OBJ output)
      *   --trace              log per-α-step max bend change to stderr
+     *   --solver dense|sparse pick LU implementation (default dense; sparse
+     *                        requires build with -DHAVE_SUPERLU + SuperLU
+     *                        link, and is O(V^1.5) instead of O(V^3))
      */
     const char *obj_dir = NULL;
     const char *bends_dir = NULL;
@@ -1050,6 +1269,14 @@ int main(int argc, char **argv) {
         }
         if (!strcmp(argv[i], "--trace")) {
             CFG_TRACE = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--solver") && i + 1 < argc) {
+            const char *s = argv[i+1];
+            if      (!strcmp(s, "dense"))  CFG_SOLVER = SOLVER_DENSE;
+            else if (!strcmp(s, "sparse")) CFG_SOLVER = SOLVER_SPARSE;
+            else { fprintf(stderr, "ERROR: --solver must be 'dense' or 'sparse'\n"); return 2; }
+            i++;
             continue;
         }
         if (i >= argc - 1) break;
@@ -1118,6 +1345,17 @@ int main(int argc, char **argv) {
         compute_bends_at_zero(u, bends_init);
         choose_base_face();
 
+#ifdef HAVE_SUPERLU
+        if (CFG_SOLVER == SOLVER_SPARSE) {
+            if (sparse_setup() < 0) {
+                fprintf(stderr, "ERROR: sparse_setup failed\n");
+                printf("sparse_setup_fail %d 0 0 0 0.0 0\n", NV);
+                build_clear();
+                continue;
+            }
+        }
+#endif
+
         int retry_used = 0;
         HomotopyResult r = homotopy(bends_init, &retry_used);
         if (r.status == 0) {
@@ -1148,6 +1386,9 @@ int main(int argc, char **argv) {
                r.final_alpha * 180.0 / M_PI, retry_used);
         if (r.status == 0) n_ok++;
 
+#ifdef HAVE_SUPERLU
+        if (CFG_SOLVER == SOLVER_SPARSE) sparse_free();
+#endif
         build_clear();
     }
     fflush(stdout);
