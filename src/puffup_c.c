@@ -24,24 +24,23 @@
 #endif
 
 #ifndef MAXV
-#define MAXV    1200      /* room for icosa{5,2}=392 + headroom for bigger subdivisions.
-                             Static cost at MAXV=1200 is ~133 MiB:
-                             EM/EM_F/EDGE_IDX (3×(MAXV+1)² int) ≈ 16.5 MiB,
-                             HJ (MAXV² double)                  ≈ 11 MiB,
-                             Jbuf (3·MAXV·MAXN double)          ≈ 99 MiB.
-                             Compile with `cc -O3 -DMAXV=N` to override (e.g.
-                             MAXV=2700 for V≈2600 runs at ~670 MiB). For very
-                             large MAXV replace the dense V×V lookup tables
-                             (EM/EM_F/EDGE_IDX) with hash maps and the dense
-                             LU with a sparse factorization. */
+#define MAXV    10000     /* Max V for the per-vertex degree-bounded statics
+                             (V_EDGE, FLOWER, etc.) and the line buffer. The
+                             former V² lookup tables (EM/EM_F/EDGE_IDX) are gone,
+                             replaced with per-vertex OutEdge lists; HJ and Jbuf
+                             are now malloc'd per case based on actual NV. So
+                             MAXV gates only the O(V·MAXRING) per-vertex statics,
+                             which total ~10 MiB at MAXV=10000. The dense path's
+                             O(V²) Jbuf is allocated dynamically and limited
+                             only by host RAM (the runtime returns
+                             dense_jbuf_fail rather than refusing to compile). */
 #endif
 #define MAXF    (2*MAXV + 4)
 #define MAXE    (3*MAXV - 6)
 #define MAXRING 16
 #ifndef MAXLINE
-#define MAXLINE 65536     /* 16K was tight for V > 400 face lists.
-                             Override at compile time, e.g. -DMAXLINE=131072,
-                             when face-list strings exceed 64K (V ≥ 2200ish). */
+#define MAXLINE (30 * MAXF + 4)   /* ~28 chars per "a,b,c;" face at MAXV-scale.
+                                     Auto-scales with MAXV. */
 #endif
 
 /* number of homotopy variables = non-base bends = E - 3 = 3V-9 */
@@ -69,18 +68,36 @@ typedef struct { int a, b, c; } Face;
 
 static int  NV, NF;
 static Face FACES[MAXF];
-static int  EM[MAXV+1][MAXV+1];        /* third vertex of face on directed (a,b) */
-static int  EM_F[MAXV+1][MAXV+1];      /* face index for directed (a,b) */
+
+/* Per-vertex out-edge records: replace the V² lookup tables (EM/EM_F/EDGE_IDX).
+ * Each directed edge v→nbr — i.e. a corner of a face at v — has one OutEdge
+ * entry. The unique face containing v→nbr in CCW order has third vertex
+ * `third`, face index `face_idx`, and the unordered edge (v,nbr) is canonical
+ * edge index `edge_idx`. Lookup is O(degree) ≤ O(MAXRING). Static cost is
+ * (MAXV+1)·(MAXRING+1)·sizeof(OutEdge), about 256 bytes/vertex; at MAXV=10000
+ * that's ~2.5 MiB total, vs ~1.2 GiB for the V² tables this replaces. */
+typedef struct { int nbr; int third; int face_idx; int edge_idx; } OutEdge;
+static OutEdge V_EDGE[MAXV+1][MAXRING+1];
+static int     V_EDGE_LEN[MAXV+1];
+
+static inline OutEdge *find_out(int u, int v) {
+    int n = V_EDGE_LEN[u];
+    for (int i = 0; i < n; i++) if (V_EDGE[u][i].nbr == v) return &V_EDGE[u][i];
+    return NULL;
+}
+/* Drop-in replacements for the former V² lookups. Sentinel values match
+ * old behavior: 0 for missing third-vertex/face-index, -1 for missing edge. */
+static inline int em(int u, int v)        { OutEdge *o = find_out(u, v); return o ? o->third    : 0;  }
+static inline int em_f(int u, int v)      { OutEdge *o = find_out(u, v); return o ? o->face_idx : 0;  }
+static inline int edge_idx(int u, int v)  { OutEdge *o = find_out(u, v); return o ? o->edge_idx : -1; }
+
 static int  DEG[MAXV+1];
 static int  NBR[MAXV+1][MAXRING];
 static int  NNBR[MAXV+1];
-static short DU[MAXF*3], DW[MAXF*3];
-static int  ND;
 
 /* edges (canonical, EDGE_A[i] < EDGE_B[i]) */
 static int  NE;
 static int  EDGE_A[MAXE], EDGE_B[MAXE];
-static int  EDGE_IDX[MAXV+1][MAXV+1];  /* edge index for unordered (u,v); -1 if none */
 
 /* per-vertex flower of face indices (cyclic walk) */
 static int  FLOWER[MAXV+1][MAXRING];
@@ -125,48 +142,49 @@ static int nbr_add(int u, int w) {
 }
 
 static void build_clear(void) {
-    for (int i = 0; i < ND; i++) {
-        EM  [DU[i]][DW[i]] = 0;
-        EM_F[DU[i]][DW[i]] = 0;
-    }
-    ND = 0;
-    for (int i = 0; i < NE; i++) {
-        EDGE_IDX[EDGE_A[i]][EDGE_B[i]] = -1;
-        EDGE_IDX[EDGE_B[i]][EDGE_A[i]] = -1;
-    }
+    /* With per-vertex V_OUT, only NE needs explicit reset for the edge counter;
+     * V_EDGE_LEN, DEG, NNBR are reset at the start of each build(). */
     NE = 0;
 }
 
 static int build(void) {
-    memset(DEG,  0, (NV+2)*sizeof(int));
-    memset(NNBR, 0, (NV+2)*sizeof(int));
-    ND = 0;
+    memset(DEG,        0, (NV+2)*sizeof(int));
+    memset(NNBR,       0, (NV+2)*sizeof(int));
+    memset(V_EDGE_LEN,  0, (NV+2)*sizeof(int));
     NE = 0;
-    /* directed edges + neighbors */
+    /* directed edges + neighbors. For each face (a,b,c): emit OutEdge entries
+     * for the 3 directed edges a→b, b→c, c→a so future em()/em_f() lookups
+     * find them. */
     for (int i = 0; i < NF; i++) {
         int a=FACES[i].a, b=FACES[i].b, c=FACES[i].c;
-        EM[a][b]=c;  EM_F[a][b]=i;  DU[ND]=a; DW[ND]=b; ND++;
-        EM[b][c]=a;  EM_F[b][c]=i;  DU[ND]=b; DW[ND]=c; ND++;
-        EM[c][a]=b;  EM_F[c][a]=i;  DU[ND]=c; DW[ND]=a; ND++;
+        if (V_EDGE_LEN[a] > MAXRING || V_EDGE_LEN[b] > MAXRING || V_EDGE_LEN[c] > MAXRING) {
+            fprintf(stderr, "ERROR: vertex degree exceeds MAXRING=%d "
+                            "(input is not a valid 6-net)\n", MAXRING);
+            return -1;
+        }
+        V_EDGE[a][V_EDGE_LEN[a]++] = (OutEdge){b, c, i, -1};
+        V_EDGE[b][V_EDGE_LEN[b]++] = (OutEdge){c, a, i, -1};
+        V_EDGE[c][V_EDGE_LEN[c]++] = (OutEdge){a, b, i, -1};
         DEG[a]++; DEG[b]++; DEG[c]++;
         if (nbr_add(a,b) || nbr_add(b,a) ||
             nbr_add(b,c) || nbr_add(c,b) ||
             nbr_add(a,c) || nbr_add(c,a)) return -1;
     }
-    /* canonical undirected edges */
+    /* canonical undirected edges. Each (u,w) with u<w is one canonical edge;
+     * record edge_idx in the OutEdge for both directions u→w and w→u. */
     for (int u = 1; u <= NV; u++) {
         for (int j = 0; j < NNBR[u]; j++) {
             int w = NBR[u][j];
             if (u < w) {
                 EDGE_A[NE] = u; EDGE_B[NE] = w;
-                EDGE_IDX[u][w] = NE;
-                EDGE_IDX[w][u] = NE;
+                OutEdge *uw = find_out(u, w); if (uw) uw->edge_idx = NE;
+                OutEdge *wu = find_out(w, u); if (wu) wu->edge_idx = NE;
                 NE++;
             }
         }
     }
-    /* flowers: walk faces around each vertex, matching plat1000 / puffup.py:
-       from face (v,b,c) step to face containing directed edge (v,c). */
+    /* flowers: walk faces around each vertex. From face (v, b, c) at v
+     * step to the face containing directed edge (v, c) — found via em_f. */
     for (int v = 1; v <= NV; v++) {
         int start = -1;
         for (int i = 0; i < NF; i++) {
@@ -186,7 +204,7 @@ static int build(void) {
             if      (v==a) third = c;
             else if (v==b) third = a;
             else           third = b;
-            int nxt = EM_F[v][third];
+            int nxt = em_f(v, third);
             if (nxt == start) break;
             cur = nxt;
         }
@@ -201,7 +219,7 @@ static int cyclic_nbrs(int v, int ring[]) {
     ring[0] = start;
     int k = 1, cur = start;
     for (;;) {
-        int nxt = EM[v][cur];
+        int nxt = em(v, cur);
         if (nxt == start) break;
         if (k >= MAXRING) {
             fprintf(stderr, "ERROR: vertex %d cyclic-nbrs exceeds MAXRING=%d\n",
@@ -268,8 +286,8 @@ static int lu_solve(double *J, double *b, int n, int stride) {
 }
 
 /* horou solver: u_out[v-1] = u[v]; u_out[0] = NaN (vertex 1 = ∞).
-   Returns 0 on success, -1 on Newton failure. */
-static double HJ[MAXV][MAXV];
+   Returns 0 on success, -1 on Newton failure.
+   HJ is V² and gets malloc'd per call; HF/Hdx are O(V). */
 static double HF[MAXV];
 static double Hdx[MAXV];
 
@@ -312,6 +330,11 @@ static int horou(double u_out[]) {
 
     for (int i = 0; i < n_int; i++) xvec[i] = 1.0;
 
+    /* Dynamic n_int × n_int Jacobian buffer (was static HJ[MAXV][MAXV]). */
+    double *HJ = malloc((size_t)n_int * n_int * sizeof(double));
+    if (!HJ) return -1;
+    #define HJ_AT(i,j) HJ[(i)*n_int + (j)]
+
     for (int it = 0; it < 200; it++) {
         double res = 0.0;
         for (int i = 0; i < n_int; i++) {
@@ -324,8 +347,7 @@ static int horou(double u_out[]) {
         }
         if (res < 1e-12) break;
 
-        for (int i = 0; i < n_int; i++)
-            for (int j = 0; j < n_int; j++) HJ[i][j] = 0.0;
+        memset(HJ, 0, (size_t)n_int * n_int * sizeof(double));
         for (int i = 0; i < n_int; i++) {
             int v = interior[i]; int k = ringlen[v]; double ui = xvec[i];
             for (int j = 0; j < k; j++) {
@@ -333,13 +355,13 @@ static int horou(double u_out[]) {
                 double uj = U(vj), uk = U(vk);
                 double dui, duj, duk;
                 petal_grad(ui, uj, uk, &dui, &duj, &duk);
-                HJ[i][i] += dui;
-                if (int_idx[vj] >= 0) HJ[i][int_idx[vj]] += duj;
-                if (int_idx[vk] >= 0) HJ[i][int_idx[vk]] += duk;
+                HJ_AT(i,i) += dui;
+                if (int_idx[vj] >= 0) HJ_AT(i,int_idx[vj]) += duj;
+                if (int_idx[vk] >= 0) HJ_AT(i,int_idx[vk]) += duk;
             }
         }
         for (int i = 0; i < n_int; i++) Hdx[i] = -HF[i];
-        if (lu_solve(&HJ[0][0], Hdx, n_int, MAXV) < 0) return -1;
+        if (lu_solve(HJ, Hdx, n_int, n_int) < 0) { free(HJ); return -1; }
 
         double step = 1.0;
         int found = 0;
@@ -376,6 +398,8 @@ static int horou(double u_out[]) {
         if (!found) break;
         for (int i = 0; i < n_int; i++) xvec[i] += step * Hdx[i];
     }
+    free(HJ);
+    #undef HJ_AT
 
 done:
     u_out[0] = NAN;  /* vertex 1 = ∞ */
@@ -416,8 +440,8 @@ static double boundaryangleat(int v, const double u[]) {
 static int compute_bends_at_zero(const double u[], double bend_out[]) {
     for (int i = 0; i < NE; i++) {
         int a = EDGE_A[i], b = EDGE_B[i];
-        /* the two faces adjacent to this edge: EM_F[a][b] and EM_F[b][a] */
-        int f1 = EM_F[a][b], f2 = EM_F[b][a];
+        /* the two faces adjacent to this edge: em_f(a,b) and em_f(b,a) */
+        int f1 = em_f(a, b), f2 = em_f(b, a);
         int third1, third2;
         {
             int x=FACES[f1].a, y=FACES[f1].b, z=FACES[f1].c;
@@ -527,7 +551,7 @@ static void choose_base_face(void) {
     /* base edges */
     for (int k = 0; k < 3; k++) {
         int u = BASE_VS[k], v = BASE_VS[(k+1)%3];
-        BASE_EDGES[k] = EDGE_IDX[u][v];
+        BASE_EDGES[k] = edge_idx(u, v);
     }
     memset(IS_BASE_EDGE, 0, NE*sizeof(int));
     IS_BASE_EDGE[BASE_EDGES[0]] = 1;
@@ -561,7 +585,7 @@ static void choose_base_face(void) {
             if      (v==a) third = c;
             else if (v==b) third = a;
             else           third = b;
-            FLOWER_E[v][t] = EDGE_IDX[v][third];
+            FLOWER_E[v][t] = edge_idx(v, third);
         }
     }
 }
@@ -591,8 +615,24 @@ static void holonomy_residual(double alpha, const double bend[], double r[]) {
     }
 }
 
-/* Build analytical Jacobian J[3*N_INT][NVAR] (row-major, stride NVAR). */
-static double Jbuf[3*MAXV * MAXN];
+/* Build analytical Jacobian J[3*N_INT][NVAR] (row-major, stride NVAR).
+ * Dense buffer is malloc'd per case based on actual N_INT/NVAR (was static
+ * V² array sized at MAXV). NULL until dense_jbuf_alloc() runs. */
+static double *Jbuf = NULL;
+
+static int dense_jbuf_alloc(void) {
+    free(Jbuf);
+    size_t n = (size_t)(3 * N_INT) * (size_t)NVAR;
+    Jbuf = malloc(n * sizeof(double));
+    if (!Jbuf) {
+        fprintf(stderr, "ERROR: dense Jbuf alloc failed (NVAR=%d, %zu doubles)\n",
+                NVAR, n);
+        return -1;
+    }
+    return 0;
+}
+
+static void dense_jbuf_free(void) { free(Jbuf); Jbuf = NULL; }
 
 /* Compute per-vertex flower products: Ms[t]=movemat(α,bend[e_t]), P[t]=∏_{s<t}Ms[s],
  * S[t]=∏_{s≥t}Ms[s]. Shared between dense `analytical_jacobian` and sparse
@@ -970,7 +1010,7 @@ static int complete_base_bends(double alpha, double bend[]) {
     /* Write recovered_A[bi] to bend on edge (BASE_VS[bi], BASE_VS[(bi+1)%3]). */
     for (int bi = 0; bi < 3; bi++) {
         int v_next = BASE_VS[(bi + 1) % 3];
-        int e_idx = EDGE_IDX[BASE_VS[bi]][v_next];
+        int e_idx = edge_idx(BASE_VS[bi], v_next);
         bend[e_idx] = recovered_A[bi];
     }
     return 0;
@@ -1194,12 +1234,12 @@ static int reconstruct(const double bend[]) {
         int verts[3] = {fa, fb, fc};
         for (int i = 0; i < 3; i++) {
             int a = verts[i], b = verts[(i+1)%3];
-            int other_fi = EM_F[b][a];   /* face with directed edge (b,a) */
+            int other_fi = em_f(b, a);   /* face with directed edge (b,a) */
             if (other_fi == fi || placed[other_fi]) continue;
             int oa=FACES[other_fi].a, ob=FACES[other_fi].b, oc=FACES[other_fi].c;
             int c = (oa!=a && oa!=b) ? oa : ((ob!=a && ob!=b) ? ob : oc);
             int p = (fa!=a && fa!=b) ? fa : ((fb!=a && fb!=b) ? fb : fc);
-            int e = EDGE_IDX[a][b];
+            int e = edge_idx(a, b);
             place_third(a, b, p, bend[e], c);
             V_PLACED[c] = 1;
             placed[other_fi] = 1;
@@ -1345,6 +1385,13 @@ int main(int argc, char **argv) {
         compute_bends_at_zero(u, bends_init);
         choose_base_face();
 
+        if (CFG_SOLVER == SOLVER_DENSE) {
+            if (dense_jbuf_alloc() < 0) {
+                printf("dense_jbuf_fail %d 0 0 0 0.0 0\n", NV);
+                build_clear();
+                continue;
+            }
+        }
 #ifdef HAVE_SUPERLU
         if (CFG_SOLVER == SOLVER_SPARSE) {
             if (sparse_setup() < 0) {
@@ -1386,6 +1433,7 @@ int main(int argc, char **argv) {
                r.final_alpha * 180.0 / M_PI, retry_used);
         if (r.status == 0) n_ok++;
 
+        if (CFG_SOLVER == SOLVER_DENSE) dense_jbuf_free();
 #ifdef HAVE_SUPERLU
         if (CFG_SOLVER == SOLVER_SPARSE) sparse_free();
 #endif
