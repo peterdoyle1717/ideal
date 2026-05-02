@@ -1,6 +1,7 @@
 src/horou_c
 src/horoz_c
 src/proof_c
+src/prove_c
 src/*.o
 proof_*.bin
 tmp_proof/

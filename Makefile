@@ -9,12 +9,14 @@ UNAME := $(shell uname)
 ifeq ($(UNAME),Darwin)
   SUPERLU_INC = -I/opt/homebrew/include
   SUPERLU_LIB = -L/opt/homebrew/lib -lsuperlu -framework Accelerate
+  LAPACK_LIB  = -framework Accelerate
 else
   SUPERLU_INC = -I/usr/include/superlu
   SUPERLU_LIB = -lsuperlu -lblas
+  LAPACK_LIB  = -llapack -lblas
 endif
 
-all: src/horou_c src/horoz_c src/proof_c src/puffup_c src/realize_c
+all: src/horou_c src/horoz_c src/proof_c src/prove_c src/puffup_c src/realize_c
 
 src/horou_c: src/horou_c.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
@@ -24,6 +26,12 @@ src/horoz_c: src/horoz_c.c
 
 src/proof_c: src/proof_c.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
+
+# Euclidean existence prover (Matt Ellison's argument, arXiv:2312.05376).
+# Requires LAPACK for SVD (dgesvd). Do NOT use -ffast-math — error bounds
+# rely on IEEE 754 semantics.
+src/prove_c: src/prove.c
+	$(CC) $(CFLAGS) -o $@ $< $(LAPACK_LIB) -lm
 
 src/puffup_c: src/puffup_c.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
@@ -40,4 +48,4 @@ src/realize_c: src/realize_c.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 clean:
-	rm -f src/horou_c src/horoz_c src/proof_c src/puffup_c src/puffup_c_sparse src/realize_c
+	rm -f src/horou_c src/horoz_c src/proof_c src/prove_c src/puffup_c src/puffup_c_sparse src/realize_c
