@@ -317,16 +317,25 @@ class HomotopyOut:
 
 # ── halfway-to-60 homotopy + auto-retry, mirrors src/puffup_c.c exactly ──
 
+# Solver hardening (2026-05-02). Mirrors puffup_c.c:
+#   - per-Newton-step bend change cap (5°), direction-preserving;
+#   - hard bend bound: every var-edge bend in (−π−ε, π+ε];
+#   - in-loop dent check skips base_face vertices; post-homotopy check
+#     covers all vertices after _complete_base_bends imputes base bends.
+_MAX_DX_CAP = math.radians(5.0)
+_BEND_BOUND = math.pi
+_BEND_EPS = 1e-12
+
+
 def _try_full_newton(tri: Tri, base_face: Face, alpha: float,
                       bends_in: Dict[Edge, float], tol: float, max_iter: int,
                       use_sparse: bool = False):
     """Full Newton (no λ damping). Returns (status, bends, iters).
-    status ∈ {'ok', 'dented', 'lstsq_fail', 'max_iter'}.
+    status ∈ {'ok', 'dented', 'lstsq_fail', 'max_iter', 'bend_oob'}.
 
     If use_sparse=True, builds the Jacobian via jacobian_sparse and solves
     with scipy.sparse.linalg.spsolve. Falls back to dense lstsq on
-    singular factorization, identical to the dense path. The dent-rejection
-    check and the tight-tol caller-driven final solve work the same way."""
+    singular factorization, identical to the dense path."""
     if use_sparse:
         from jacobian_sparse import analytical_jacobian_sparse
         import scipy.sparse.linalg as _spla
@@ -341,8 +350,11 @@ def _try_full_newton(tri: Tri, base_face: Face, alpha: float,
         b = dict(bends_in)
         for e, v in zip(var_edges, x): b[e] = float(v)
         return b
-    def is_dented(b):
-        return any(vertex_turn(tri, v, b) < 0.0 for v in tri.vertices)
+    def is_dented_inloop(b):
+        # Skip base-face vertices: their sums include the 2 frozen base
+        # bends and don't reflect the var-edge state Newton controls.
+        return any(vertex_turn(tri, v, b) < 0.0
+                    for v in tri.vertices if v not in base_face)
     x = np.array([bends_in[e] for e in var_edges])
     for it in range(max_iter):
         r = F(x)
@@ -355,7 +367,6 @@ def _try_full_newton(tri: Tri, base_face: Face, alpha: float,
                 if not np.all(np.isfinite(dx)):
                     raise RuntimeError('spsolve gave non-finite result')
             except Exception:
-                # Singular sparse factorization → fall back to dense lstsq.
                 Jd = Jsp.toarray()
                 try:
                     dx, *_ = np.linalg.lstsq(Jd, -r, rcond=None)
@@ -370,15 +381,25 @@ def _try_full_newton(tri: Tri, base_face: Face, alpha: float,
                     dx, *_ = np.linalg.lstsq(J, -r, rcond=None)
                 except np.linalg.LinAlgError:
                     return 'lstsq_fail', to_b(x), it
-        x = x + dx
-        if is_dented(to_b(x)):
+        # Direction-preserving Newton step cap.
+        m = float(np.max(np.abs(dx))) if dx.size else 0.0
+        if m > _MAX_DX_CAP:
+            dx = dx * (_MAX_DX_CAP / m)
+        # Apply step + check bend bound.
+        x_new = x + dx
+        if (np.any(x_new <= -_BEND_BOUND - _BEND_EPS) or
+            np.any(x_new  >  _BEND_BOUND + _BEND_EPS)):
+            return 'bend_oob', to_b(x_new), it + 1
+        x = x_new
+        if is_dented_inloop(to_b(x)):
             return 'dented', to_b(x), it + 1
     return 'max_iter', to_b(x), max_iter
 
 
 def homotopy_with(tri: Tri, base_face: Face, bends_init: Dict[Edge, float],
                    init_step_deg: float, max_newton: int, loose_tol: float,
-                   target_alpha_deg: float = 60.0, use_sparse: bool = False):
+                   target_alpha_deg: float = 60.0, use_sparse: bool = False,
+                   verbose: bool = False):
     """α-additive homotopy from 0 to target_alpha_deg with halve-on-failure
     and a halfway step cap. Halve α_step on dent or max_iter, no growth.
     Final cleanup at TIGHT_TOL=1e-12. Returns dict with status, n_steps,
@@ -402,16 +423,26 @@ def homotopy_with(tri: Tri, base_face: Face, bends_init: Dict[Edge, float],
     alpha_curr = 0.0
     alpha_step = math.radians(init_step_deg)
     n_steps = n_halve = newton_total = 0
+    base_edges = [edge_key(base_face[i], base_face[(i+1) % 3]) for i in range(3)]
+    base_edge_set = set(base_edges)
+    var_edges = [e for e in tri.edges if e not in base_edge_set]
     for _ in range(MAX_ATTEMPTS):
         if alpha_curr >= ALPHA_FINAL:
             break
         cap = (GOAL - alpha_curr) / 2
         used = min(alpha_step, cap)
         a_try = alpha_curr + used
+        snap = {e: bends[e] for e in var_edges} if verbose else None
         st, b_new, iters = _try_full_newton(tri, base_face, a_try, bends,
                                               loose_tol, max_newton, use_sparse)
         newton_total += iters
         if st == 'ok':
+            if verbose:
+                mxd = max(abs(b_new[e] - snap[e]) for e in var_edges)
+                print(f"STEP α={math.degrees(alpha_curr):.4f}° → "
+                      f"{math.degrees(a_try):.4f}°  "
+                      f"max_dbend={math.degrees(mxd):.3f}°  iters={iters}",
+                      file=sys.stderr)
             bends = b_new
             alpha_curr = a_try
             n_steps += 1
@@ -427,6 +458,21 @@ def homotopy_with(tri: Tri, base_face: Face, bends_init: Dict[Edge, float],
                                               TIGHT_TOL, 30, use_sparse)
         newton_total += iters
         if st == 'ok':
+            # Mirror puffup_c.c:855-864: impute the 3 base-edge bends via
+            # the atan2 closed form, then run a post-homotopy dent check
+            # over EVERY vertex (including base — the in-loop check skipped
+            # those because their sums included the frozen base bends).
+            try:
+                b_new = _complete_base_bends(tri, base_face, alpha_curr,
+                                              b_new, base_edges)
+            except ValueError:
+                return {'status': 'stuck', 'n_steps': n_steps, 'n_halve': n_halve,
+                        'newton_iters': newton_total, 'final_alpha': alpha_curr,
+                        'bends': b_new}
+            if any(vertex_turn(tri, v, b_new) < 0.0 for v in tri.vertices):
+                return {'status': 'stuck', 'n_steps': n_steps, 'n_halve': n_halve,
+                        'newton_iters': newton_total, 'final_alpha': alpha_curr,
+                        'bends': b_new}
             return {'status': 'ok', 'n_steps': n_steps, 'n_halve': n_halve,
                     'newton_iters': newton_total, 'final_alpha': alpha_curr,
                     'bends': b_new}
