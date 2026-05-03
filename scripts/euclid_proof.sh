@@ -1,34 +1,34 @@
 #!/bin/bash
-# prove.sh — gated entry point for the Euclidean existence prover.
+# euclid_proof.sh — gated entry point for the Euclidean existence prover.
 #
-# Wraps src/prove_c with a mandatory CGAL embed_check on input. OBJs
+# Wraps src/euclid_proof with a mandatory CGAL embed_check on input. OBJs
 # that fail embed_check are reported as FAIL not_embedded and never
-# reach the Kantorovich math; OBJs that pass go on to prove_c.
+# reach the Kantorovich math; OBJs that pass go on to euclid_proof.
 #
 # This is the "lady and bathtub" boundary check — even when input
 # OBJs come from puffup_c (which has its own dent gate), the prover
 # treats every OBJ as untrusted.
 #
 # Usage:
-#   scripts/prove.sh OBJDIR
-#   scripts/prove.sh OBJ.obj
+#   scripts/euclid_proof.sh OBJDIR
+#   scripts/euclid_proof.sh OBJ.obj
 
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EMBED="$ROOT/src/embed_check"
-PROVE="$ROOT/src/prove_c"
+PROVE="$ROOT/src/euclid_proof"
 
 if [ ! -x "$EMBED" ]; then
     echo "FAIL embed_check_unavailable: build with 'make src/embed_check' (needs CGAL+gmp+mpfr)" >&2
     exit 2
 fi
 if [ ! -x "$PROVE" ]; then
-    echo "FAIL prove_c_unavailable: build with 'make src/prove_c'" >&2
+    echo "FAIL euclid_proof_unavailable: build with 'make src/euclid_proof'" >&2
     exit 2
 fi
 if [ $# -lt 1 ]; then
-    echo "usage: prove.sh OBJDIR | OBJ.obj" >&2
+    echo "usage: $(basename "$0") OBJDIR | OBJ.obj" >&2
     exit 1
 fi
 
@@ -70,7 +70,7 @@ while read -r v _stem; do
     i=$((i + 1))
 done < "$TMP/embed.txt"
 
-# Print FAIL not_embedded lines first, then run prove_c on the survivors.
+# Print FAIL not_embedded lines first, then run euclid_proof on the survivors.
 [ -s "$fail_lines" ] && cat "$fail_lines"
 
 if [ "$n_emb" -gt 0 ]; then

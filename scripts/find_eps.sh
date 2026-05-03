@@ -8,13 +8,13 @@
 #   ./scripts/find_eps.sh 25
 #   PRIME_DIR=~/neo/clers/fuller/prime ./scripts/find_eps.sh 60
 #
-# Requires: src/proof_c compiled (run: make), ../clers/python/clers_decode.py
+# Requires: src/ideal_proof compiled (run: make), ../clers/python/clers_decode.py
 
 set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-PROOF="$ROOT/src/proof_c"
+PROOF="$ROOT/src/ideal_proof"
 DECODE="$(cd "$ROOT/../clers/python" && pwd)/clers_decode.py"
 PRIME="${PRIME_DIR:-$(cd "$ROOT/../clers/fuller/prime" && pwd)}"
 TMP="$ROOT/tmp_findeps"

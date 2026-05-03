@@ -1,5 +1,5 @@
 /*
- * realize_c.c — Klein-OBJ realization from a puffup bends file. (v2)
+ * hyperpuff_c.c — Klein-OBJ realization from a puffup bends file. (v2)
  *
  * Reads a single .bends file on stdin (the format puffup_c writes with
  * --bends-out):
@@ -44,8 +44,8 @@
  * solver's movemat(α, β) = matz(α) · matx(−β) — same convention, no
  * D-conjugation.
  *
- * Compile: cc -O3 -o realize_c realize_c.c -lm
- * Usage:   realize_c < net.bends > net.obj
+ * Compile: cc -O3 -o hyperpuff_c hyperpuff_c.c -lm
+ * Usage:   hyperpuff_c < net.bends > net.obj
  */
 
 #include <stdio.h>
@@ -401,7 +401,7 @@ static int bfs_place(void) {
 
 /* ---------- output (Klein projection) -------------------------------------- */
 static void write_klein_obj(FILE *fh) {
-    fprintf(fh, "# Klein realization (realize_c v2) — α=%.10g°, side s=%.10g\n",
+    fprintf(fh, "# Klein realization (hyperpuff_c v2) — α=%.10g°, side s=%.10g\n",
             ALPHA_DEG, S_LEN);
     for (int v = 1; v <= NV; v++) {
         double w = V[v][3];

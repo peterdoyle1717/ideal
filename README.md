@@ -37,7 +37,7 @@ The motivating combinatorial inputs in the broader project are prime 6-nets, but
     └── src/
         ├── horou_c.c
         ├── horoz_c.c
-        └── proof_c.c
+        └── ideal_proof.c
 
 ## Build
 
@@ -95,7 +95,7 @@ Python examples:
 
 C example:
 
-    ../clers/bin/clers decode < 20.txt | src/proof_c > proof_20.bin
+    ../clers/bin/clers decode < 20.txt | src/ideal_proof > proof_20.bin
 
 ## Results currently checked in
 

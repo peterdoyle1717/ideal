@@ -1,4 +1,4 @@
-/* prove.c — prove existence of unit-edge-length polyhedra
+/* euclid_proof.c — prove existence of unit-edge-length polyhedra
  *
  * C port of prove_float.py. Uses IEEE 754 double precision with
  * rigorous error tracking. Requires LAPACK for SVD (dgesvd).
@@ -21,9 +21,9 @@
  *   rho:       |rho_true - rho_float| <= (2E+10)*eps*rho      (accumulation)
  *   CD:        |CD_true - CD_float| <= 100*eps*CD              (arithmetic)
  *
- * Usage:   prove objdir/ | prove file.obj
+ * Usage:   euclid_proof objdir/ | euclid_proof file.obj
  *          Reads OBJ file(s), prints PASS/FAIL per net.
- * Compile: cc -O3 -o prove prove.c -lm -llapack -lblas
+ * Compile: cc -O3 -o euclid_proof euclid_proof.c -lm -llapack -lblas
  *          (do NOT use -ffast-math)
  */
 

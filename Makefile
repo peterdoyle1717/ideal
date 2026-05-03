@@ -21,7 +21,7 @@ else
   CGAL_LIB    = -lgmp -lmpfr
 endif
 
-all: src/horou_c src/horoz_c src/proof_c src/prove_c src/puffup_c src/realize_c src/embed_check
+all: src/horou_c src/horoz_c src/ideal_proof src/euclid_proof src/puffup_c src/hyperpuff_c src/embed_check
 
 src/horou_c: src/horou_c.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
@@ -29,13 +29,13 @@ src/horou_c: src/horou_c.c
 src/horoz_c: src/horoz_c.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
-src/proof_c: src/proof_c.c
+src/ideal_proof: src/ideal_proof.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 # Euclidean existence prover (Matt Ellison's argument, arXiv:2312.05376).
 # Requires LAPACK for SVD (dgesvd). Do NOT use -ffast-math — error bounds
 # rely on IEEE 754 semantics.
-src/prove_c: src/prove.c
+src/euclid_proof: src/euclid_proof.c
 	$(CC) $(CFLAGS) -o $@ $< $(LAPACK_LIB) -lm
 
 src/puffup_c: src/puffup_c.c
@@ -49,7 +49,7 @@ src/puffup_c_sparse: src/puffup_c.c
 
 sparse: src/puffup_c_sparse
 
-src/realize_c: src/realize_c.c
+src/hyperpuff_c: src/hyperpuff_c.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 # Certified embeddedness check via CGAL Polygon_mesh_processing.
@@ -59,4 +59,4 @@ src/embed_check: src/embed_check.cpp
 	$(CXX) -O2 -std=c++17 $(CGAL_INC) -o $@ $< $(CGAL_LIB)
 
 clean:
-	rm -f src/horou_c src/horoz_c src/proof_c src/prove_c src/puffup_c src/puffup_c_sparse src/realize_c src/embed_check
+	rm -f src/horou_c src/horoz_c src/ideal_proof src/euclid_proof src/puffup_c src/puffup_c_sparse src/hyperpuff_c src/embed_check

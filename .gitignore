@@ -1,5 +1,8 @@
 src/horou_c
 src/horoz_c
+src/ideal_proof
+src/euclid_proof
+# legacy names (pre-rename), kept ignored so stale local builds don't show up:
 src/proof_c
 src/prove_c
 src/*.o
@@ -12,5 +15,7 @@ tmp_closure/
 __pycache__/
 .DS_Store
 src/puffup_c
-src/realize_c
+src/hyperpuff_c
 src/embed_check
+# legacy name (pre-rename):
+src/realize_c

@@ -1268,7 +1268,7 @@ static void write_obj(FILE *fh) {
 
 /* ---------- bends-file output --------------------------------------------
  * Writes the homotopy state at the requested target α: per-edge bends
- * (canonical, EDGE_A[i] < EDGE_B[i]) plus header. realize_c consumes this
+ * (canonical, EDGE_A[i] < EDGE_B[i]) plus header. hyperpuff_c consumes this
  * to produce a Klein OBJ. */
 static void write_bends(FILE *fh, double alpha, const char *netcode,
                          const double bend[]) {
@@ -1300,7 +1300,7 @@ int main(int argc, char **argv) {
      *                        (only valid when --target-alpha-deg is 60)
      *   --target-alpha-deg N halt homotopy at α = N° (default 60)
      *   --bends-out DIR      write per-edge bends to DIR/<n>.bends
-     *                        (consumed by realize_c for Klein OBJ output)
+     *                        (consumed by hyperpuff_c for Klein OBJ output)
      *   --trace              log per-α-step max bend change to stderr
      *   --solver dense|sparse pick LU implementation. Default flips with
      *                        the build: with -DHAVE_SUPERLU + SuperLU link,

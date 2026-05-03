@@ -14,7 +14,7 @@
 #   ./scripts/run_proof_doob.sh 81 100    # extend range
 #
 # Requires:
-#   src/proof_c compiled  (run: make)
+#   src/ideal_proof compiled  (run: make)
 #   ../clers/python/clers_decode.py
 #   $PRIME_DIR/N.txt[.gz]  (default: ../clers/fuller/prime)
 
@@ -22,7 +22,7 @@ set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-PROOF="$ROOT/src/proof_c"
+PROOF="$ROOT/src/ideal_proof"
 DECODE="$(cd "$ROOT/../clers/python" && pwd)/clers_decode.py"
 PRIME="${PRIME_DIR:-$(cd "$ROOT/../clers/fuller/prime" && pwd)}"
 TMP="$ROOT/tmp_proof"

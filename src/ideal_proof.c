@@ -1,5 +1,5 @@
 /*
- * proof_c.c — sub/supersolution proof checker for ideal horoball packings.
+ * ideal_proof.c — sub/supersolution proof checker for ideal horoball packings.
  *
  * For each net, computes:
  *   umin = horou(-eps)   — subsolution (angle sum = 2π+eps > 2π at every interior vertex)
@@ -13,8 +13,8 @@
  *           value ≤ 0  → some check failed
  *           NaN        → solver failed
  *
- * Compile:  cc -O3 -o proof_c proof_c.c -lm
- * Run:      python3 ../clers/python/clers_decode.py < prime/60.txt | ./proof_c > proof_60.bin
+ * Compile:  cc -O3 -o ideal_proof ideal_proof.c -lm
+ * Run:      python3 ../clers/python/clers_decode.py < prime/60.txt | ./ideal_proof > proof_60.bin
  *
  * Optional arg: fixed eps (e.g. "0.000125" = 1/8000).
  * In fixed mode: output 1.0 (proved) or NaN (not proved).
