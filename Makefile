@@ -21,7 +21,7 @@ else
   CGAL_LIB    = -lgmp -lmpfr
 endif
 
-all: src/horou_c src/horoz_c src/ideal_proof src/euclid_proof src/puffup_c src/hyperpuff_c src/embed_check
+all: src/horou_c src/horoz_c src/ideal_proof src/euclid_prover src/puffup_c src/hyperpuff_c src/embed_check
 
 src/horou_c: src/horou_c.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
@@ -33,10 +33,13 @@ src/ideal_proof: src/ideal_proof.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 # Euclidean existence prover (Matt Ellison's argument, arXiv:2312.05376).
-# Requires LAPACK for SVD (dgesvd). Do NOT use -ffast-math — error bounds
-# rely on IEEE 754 semantics.
-src/euclid_proof: src/euclid_proof.c
-	$(CC) $(CFLAGS) -o $@ $< $(LAPACK_LIB) -lm
+# Dependency-free: a homegrown Jacobi eigensolver proposes a sigma_min
+# candidate, a Cholesky witness factor is checked by IEEE-bounded
+# interval residual checks (||I-BC||_F, ||A-CCT||_F). libm only.
+# Do NOT use -ffast-math — the certified residual bounds rely on
+# IEEE 754 semantics + nextafter rounding.
+src/euclid_prover: src/euclid_prover.c
+	$(CC) $(CFLAGS) -o $@ $< -lm
 
 src/puffup_c: src/puffup_c.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
@@ -59,4 +62,4 @@ src/embed_check: src/embed_check.cpp
 	$(CXX) -O2 -std=c++17 $(CGAL_INC) -o $@ $< $(CGAL_LIB)
 
 clean:
-	rm -f src/horou_c src/horoz_c src/ideal_proof src/euclid_proof src/puffup_c src/puffup_c_sparse src/hyperpuff_c src/embed_check
+	rm -f src/horou_c src/horoz_c src/ideal_proof src/euclid_prover src/puffup_c src/puffup_c_sparse src/hyperpuff_c src/embed_check
