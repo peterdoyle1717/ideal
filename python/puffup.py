@@ -217,7 +217,8 @@ class NewtonOut:
     message: str
 
 
-def newton(fun, x0: np.ndarray, tol: float = 1e-12, max_iter: int = 60) -> NewtonOut:
+def newton(fun, x0: np.ndarray, tol: float = 1e-12, max_iter: int = 60,
+           iter_log: Optional[List[dict]] = None) -> NewtonOut:
     x = np.array(x0, float)
     r = fun(x)
     norm = float(np.linalg.norm(r))
@@ -225,16 +226,33 @@ def newton(fun, x0: np.ndarray, tol: float = 1e-12, max_iter: int = 60) -> Newto
         if norm <= tol:
             return NewtonOut(x, r, True, it, "tol")
         J = fd_jacobian(fun, x)
+        cond_J = float("nan")
+        if iter_log is not None and J.size:
+            try:
+                cond_J = float(np.linalg.cond(J))
+            except Exception:
+                cond_J = float("nan")
         try:
             dx, *_ = np.linalg.lstsq(J, -r, rcond=None)
         except np.linalg.LinAlgError as exc:
             return NewtonOut(x, r, False, it, f"lstsq fail: {exc}")
         lam = 1.0
         improved = False
+        line_steps = 0
         for _ in range(40):
             r_try = fun(x + lam * dx)
             n_try = float(np.linalg.norm(r_try))
+            line_steps += 1
             if n_try < norm:
+                if iter_log is not None:
+                    iter_log.append({
+                        "solver": "newton", "iter": it,
+                        "n_before": norm, "n_after": n_try,
+                        "line_lambda": lam, "line_steps": line_steps,
+                        "delta_norm": float(np.linalg.norm(lam * dx)),
+                        "delta_max": float(np.max(np.abs(lam * dx))) if dx.size else 0.0,
+                        "cond_J": cond_J,
+                    })
                 x = x + lam * dx
                 r = r_try
                 norm = n_try
@@ -243,6 +261,88 @@ def newton(fun, x0: np.ndarray, tol: float = 1e-12, max_iter: int = 60) -> Newto
             lam *= 0.5
         if not improved:
             return NewtonOut(x, r, False, it, "line search fail")
+    return NewtonOut(x, r, norm <= tol, max_iter, "max iter")
+
+
+def solver_lm(fun, x0: np.ndarray, tol: float = 1e-12, max_iter: int = 60,
+              lambda_init: float = 1e-3, lambda_down: float = 0.3,
+              lambda_up: float = 10.0, lambda_max: float = 1e12,
+              max_lm_retries: int = 20, tiny_rel: float = 1e-12,
+              iter_log: Optional[List[dict]] = None) -> NewtonOut:
+    """Levenberg–Marquardt with Marquardt scaling D = diag(J^T J).
+
+    LM step: solve (A + lambda * diag(D)) @ delta = -g, A = J^T J, g = J^T r.
+    Accept iff strict residual decrease. lambda is preserved across outer
+    iterations (skipper plan, Codex audit 2026-05-06). Residual-only
+    acceptance at this layer; dent/turning gates live in the calling
+    homotopy driver, parallel to newton().
+    """
+    x = np.array(x0, float)
+    r = fun(x)
+    norm = float(np.linalg.norm(r))
+    lam = lambda_init
+    for it in range(max_iter):
+        if norm <= tol:
+            return NewtonOut(x, r, True, it, "tol")
+        J = fd_jacobian(fun, x)
+        A = J.T @ J
+        g = J.T @ r
+        diagA = np.diag(A).copy()
+        if diagA.size > 0:
+            floor = max(tiny_rel * float(np.max(diagA)), 1e-30)
+            D = np.maximum(diagA, floor)
+        else:
+            D = diagA
+        cond_J = float("nan")
+        if iter_log is not None and J.size:
+            try:
+                cond_J = float(np.linalg.cond(J))
+            except Exception:
+                cond_J = float("nan")
+        accepted = False
+        retries_lin = 0
+        retries_residual = 0
+        for _ in range(max_lm_retries):
+            try:
+                delta = np.linalg.solve(A + lam * np.diag(D), -g)
+            except np.linalg.LinAlgError:
+                retries_lin += 1
+                lam = min(lam * lambda_up, lambda_max)
+                if lam >= lambda_max:
+                    return NewtonOut(x, r, False, it, "lambda_saturated_linsolve")
+                continue
+            x_trial = x + delta
+            r_trial = fun(x_trial)
+            n_trial = float(np.linalg.norm(r_trial))
+            if n_trial < norm:
+                if iter_log is not None:
+                    iter_log.append({
+                        "solver": "lm", "iter": it,
+                        "n_before": norm, "n_after": n_trial,
+                        "lambda": lam,
+                        "delta_norm": float(np.linalg.norm(delta)),
+                        "delta_max": float(np.max(np.abs(delta))) if delta.size else 0.0,
+                        "retries_linsolve": retries_lin,
+                        "retries_residual": retries_residual,
+                        "cond_J": cond_J,
+                    })
+                # Tiny-step stall detection.
+                if (float(np.linalg.norm(delta)) <
+                        1e-15 * (1.0 + float(np.linalg.norm(x))) and
+                        n_trial >= norm):
+                    return NewtonOut(x_trial, r_trial, False, it, "stalled")
+                x = x_trial
+                r = r_trial
+                norm = n_trial
+                lam = max(lam * lambda_down, 1e-30)
+                accepted = True
+                break
+            retries_residual += 1
+            lam = min(lam * lambda_up, lambda_max)
+            if lam >= lambda_max:
+                return NewtonOut(x, r, False, it, "lambda_saturated")
+        if not accepted:
+            return NewtonOut(x, r, False, it, "lm_retries_exhausted")
     return NewtonOut(x, r, norm <= tol, max_iter, "max iter")
 
 
@@ -514,6 +614,8 @@ def solve_homotopy(
     grow_factor: float = 1.5,            # multiply step on K consecutive successes
     grow_after: int = 3,                  # K
     max_step_factor: float = 0.5,         # cap on grown step
+    solver: str = "newton",
+    iter_log: Optional[List[dict]] = None,
 ) -> HomotopyOut:
     var_edges = [e for e in tri.edges
                  if e != edge_key(base_face[0], base_face[1])
@@ -527,7 +629,8 @@ def solve_homotopy(
     span = target_alpha - from_alpha
     if abs(span) < 1e-15:
         # Single solve, no homotopy needed
-        return _final_solve(tri, base_face, target_alpha, bend, var_edges, base_edges)
+        return _final_solve(tri, base_face, target_alpha, bend, var_edges, base_edges,
+                            solver=solver, iter_log=iter_log)
 
     t = 0.0
     step = step_factor
@@ -549,7 +652,10 @@ def solve_homotopy(
             return holonomy_residual(tri, base_face, var_edges, x,
                                      {e: bend[e] for e in base_edges}, alpha1)
 
-        out = newton(F, x_init)
+        if solver == "lm":
+            out = solver_lm(F, x_init, iter_log=iter_log)
+        else:
+            out = newton(F, x_init, iter_log=iter_log)
         iters_total += out.iters
 
         # Provisional bend dict with the trial solution
@@ -603,13 +709,16 @@ def solve_homotopy(
             successes_in_a_row = 0
 
     # Now final-solve at target_alpha (already there if t reached 1.0)
-    return _final_solve(tri, base_face, target_alpha, bend, var_edges, base_edges, steps, iters_total)
+    return _final_solve(tri, base_face, target_alpha, bend, var_edges, base_edges,
+                        steps, iters_total, solver=solver, iter_log=iter_log)
 
 
 def _final_solve(
     tri: Tri, base_face: Face, target_alpha: float,
     bend: Dict[Edge, float], var_edges: List[Edge], base_edges: List[Edge],
     steps: Optional[List[dict]] = None, iters_total: int = 0,
+    solver: str = "newton",
+    iter_log: Optional[List[dict]] = None,
 ) -> HomotopyOut:
     if steps is None:
         steps = []
@@ -617,7 +726,10 @@ def _final_solve(
     def F(x: np.ndarray) -> np.ndarray:
         return holonomy_residual(tri, base_face, var_edges, x,
                                  {e: bend[e] for e in base_edges}, target_alpha)
-    out = newton(F, np.array([bend[e] for e in var_edges]))
+    if solver == "lm":
+        out = solver_lm(F, np.array([bend[e] for e in var_edges]), iter_log=iter_log)
+    else:
+        out = newton(F, np.array([bend[e] for e in var_edges]), iter_log=iter_log)
     iters_total += out.iters
     final_bend = dict(bend)
     for e, v in zip(var_edges, out.x):
@@ -797,15 +909,26 @@ def run_one(payload: dict) -> dict:
     init = normalize_initial_bends(payload["initial_bends"], tri.edges)
 
     homo = payload.get("homotopy")
+    solver_kind = str(payload.get("solver", "newton")).lower()
+    if solver_kind not in {"newton", "lm"}:
+        raise ValueError(f"unknown solver {solver_kind!r}; expected 'newton' or 'lm'")
+    iter_log_path = payload.get("iter_log")
+    iter_log: Optional[List[dict]] = [] if iter_log_path else None
     if homo is None:
-        out = solve_homotopy(tri, base_face, alpha, init, from_alpha=alpha)
+        out = solve_homotopy(tri, base_face, alpha, init, from_alpha=alpha,
+                             solver=solver_kind, iter_log=iter_log)
     else:
         out = solve_homotopy(
             tri, base_face, alpha, init,
             from_alpha=float(homo.get("from_corner", 0.0)),
             step_factor=float(homo.get("step_factor", 1.0 / 24.0)),
             min_step_factor=float(homo.get("min_step_factor", 1e-3)),
+            solver=solver_kind, iter_log=iter_log,
         )
+    if iter_log_path and iter_log is not None:
+        with open(iter_log_path, "w") as fh:
+            for rec in iter_log:
+                fh.write(json.dumps(rec) + "\n")
 
     avg_pos, spread = reconstruct(tri, base_face, out.bend_full)
     turns = {str(v): vertex_turn(tri, v, out.bend_full) for v in tri.vertices}
@@ -838,10 +961,18 @@ def main(argv: List[str]) -> int:
                    help="output JSON file ('-' for stdout)")
     p.add_argument("--indent", type=int, default=2,
                    help="JSON indent (default 2; 0 for compact)")
+    p.add_argument("--solver", choices=["newton", "lm"], default=None,
+                   help="solver for inner residual reduction (overrides payload)")
+    p.add_argument("--iter-log", default=None,
+                   help="path to write per-iteration JSONL solver log")
     args = p.parse_args(argv)
 
     text = sys.stdin.read() if args.inp == "-" else open(args.inp).read()
     payload = json.loads(text)
+    if args.solver is not None:
+        payload["solver"] = args.solver
+    if args.iter_log is not None:
+        payload["iter_log"] = args.iter_log
     result = run_one(payload)
     out_text = json.dumps(result, indent=args.indent if args.indent > 0 else None)
     if args.outp == "-":
