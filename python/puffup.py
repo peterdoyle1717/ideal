@@ -268,14 +268,19 @@ def solver_lm(fun, x0: np.ndarray, tol: float = 1e-12, max_iter: int = 60,
               lambda_init: float = 1e-3, lambda_down: float = 0.3,
               lambda_up: float = 10.0, lambda_max: float = 1e12,
               max_lm_retries: int = 20, tiny_rel: float = 1e-12,
-              iter_log: Optional[List[dict]] = None) -> NewtonOut:
+              iter_log: Optional[List[dict]] = None,
+              trial_gate=None) -> NewtonOut:
     """Levenberg–Marquardt with Marquardt scaling D = diag(J^T J).
 
     LM step: solve (A + lambda * diag(D)) @ delta = -g, A = J^T J, g = J^T r.
-    Accept iff strict residual decrease. lambda is preserved across outer
-    iterations (skipper plan, Codex audit 2026-05-06). Residual-only
-    acceptance at this layer; dent/turning gates live in the calling
-    homotopy driver, parallel to newton().
+    Accept iff strict residual decrease AND (trial_gate is None or
+    trial_gate(x_trial) returns True). lambda is preserved across outer
+    iterations.
+
+    trial_gate(x_trial) -> bool: optional caller-supplied predicate
+    (e.g. dent-free check on reconstructed bends). Returning False rejects
+    the trial as if residual had increased — lambda goes up, x stays put,
+    retry. Trial dent rejections counted separately in iter_log.
     """
     x = np.array(x0, float)
     r = fun(x)
@@ -302,6 +307,7 @@ def solver_lm(fun, x0: np.ndarray, tol: float = 1e-12, max_iter: int = 60,
         accepted = False
         retries_lin = 0
         retries_residual = 0
+        retries_dent = 0
         for _ in range(max_lm_retries):
             try:
                 delta = np.linalg.solve(A + lam * np.diag(D), -g)
@@ -314,7 +320,7 @@ def solver_lm(fun, x0: np.ndarray, tol: float = 1e-12, max_iter: int = 60,
             x_trial = x + delta
             r_trial = fun(x_trial)
             n_trial = float(np.linalg.norm(r_trial))
-            if n_trial < norm:
+            if n_trial < norm and (trial_gate is None or trial_gate(x_trial)):
                 if iter_log is not None:
                     iter_log.append({
                         "solver": "lm", "iter": it,
@@ -324,6 +330,7 @@ def solver_lm(fun, x0: np.ndarray, tol: float = 1e-12, max_iter: int = 60,
                         "delta_max": float(np.max(np.abs(delta))) if delta.size else 0.0,
                         "retries_linsolve": retries_lin,
                         "retries_residual": retries_residual,
+                        "retries_dent": retries_dent,
                         "cond_J": cond_J,
                     })
                 # Tiny-step stall detection.
@@ -337,7 +344,12 @@ def solver_lm(fun, x0: np.ndarray, tol: float = 1e-12, max_iter: int = 60,
                 lam = max(lam * lambda_down, 1e-30)
                 accepted = True
                 break
-            retries_residual += 1
+            # Trial rejected. Distinguish residual-fail from dent-fail.
+            if n_trial >= norm:
+                retries_residual += 1
+            else:
+                # n_trial decreased but trial_gate vetoed → dent.
+                retries_dent += 1
             lam = min(lam * lambda_up, lambda_max)
             if lam >= lambda_max:
                 return NewtonOut(x, r, False, it, "lambda_saturated")
