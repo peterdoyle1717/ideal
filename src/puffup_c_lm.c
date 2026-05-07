@@ -236,6 +236,268 @@ static void choose_base_face(void) {
     }
 }
 
+/* ---------- horou (port of src/horou_c.c, adapted to local topology) ------ */
+/* Reference: src/horou_c.c and the horou block in src/puffup_c.c (lines
+   242-417). All algebra preserved; only the topology accesses are swapped
+   to use FLOWER_THIRD / DIRECTED_FACE / VERT_DEG. */
+static double horou_petal(double ui, double uj, double uk) {
+    double a=ui*uj, b=ui*uk, c=uj*uk;
+    double cos_t = (a*a + b*b - c*c) / (2.0*a*b);
+    if (cos_t >  1.0) cos_t =  1.0;
+    if (cos_t < -1.0) cos_t = -1.0;
+    return acos(cos_t);
+}
+static void horou_petal_grad(double ui, double uj, double uk,
+                              double *dui, double *duj, double *duk) {
+    double a=ui*uj, b=ui*uk, c=uj*uk;
+    double cos_t = (a*a + b*b - c*c) / (2.0*a*b);
+    if (cos_t >  1.0) cos_t =  1.0;
+    if (cos_t < -1.0) cos_t = -1.0;
+    double sin_t = sqrt(1.0 - cos_t*cos_t);
+    if (sin_t < 1e-15) { *dui = *duj = *duk = 0.0; return; }
+    double s = -1.0 / sin_t;
+    *dui = s * (uj*uk / (ui*ui*ui));
+    *duj = s * (1.0/(2*uk) - uk/(2*uj*uj) - uk/(2*ui*ui));
+    *duk = s * (1.0/(2*uj) - uj/(2*uk*uk) - uj/(2*ui*ui));
+}
+
+/* Generic in-place LU + back-sub. row-major n×n in J, RHS in b. */
+static int horou_lu_solve(double *J, double *b, int n) {
+    for (int col = 0; col < n; col++) {
+        int piv = col;
+        double best = fabs(J[col*n + col]);
+        for (int r = col+1; r < n; r++) {
+            double v = fabs(J[r*n + col]);
+            if (v > best) { best = v; piv = r; }
+        }
+        if (best < 1e-14) return -1;
+        if (piv != col) {
+            for (int k = col; k < n; k++) {
+                double t = J[col*n + k]; J[col*n + k] = J[piv*n + k]; J[piv*n + k] = t;
+            }
+            double t = b[col]; b[col] = b[piv]; b[piv] = t;
+        }
+        double inv = 1.0 / J[col*n + col];
+        for (int r = col+1; r < n; r++) {
+            double fac = J[r*n + col] * inv;
+            for (int k = col; k < n; k++) J[r*n + k] -= fac * J[col*n + k];
+            b[r] -= fac * b[col];
+        }
+    }
+    for (int i = n-1; i >= 0; i--) {
+        double s = b[i];
+        for (int j = i+1; j < n; j++) s -= J[i*n + j] * b[j];
+        b[i] = s / J[i*n + i];
+    }
+    return 0;
+}
+
+/* horou solver: returns u_out[v-1] for v=2..NV. u_out[0] = NaN
+   (vertex 1 is the point at infinity). Boundary vertices (neighbors of 1)
+   are pinned to u=1; interior vertices solved by Newton with petal-sum
+   = 2π constraint per interior vertex.
+   Returns 0 on success, -1 on failure. */
+static int horou_solve(double *u_out) {
+    const double TAU = 2.0 * PI;
+    int *bndry = (int *)xcalloc(NV + 2, sizeof(int));
+    int *int_idx = (int *)xcalloc(NV + 2, sizeof(int));
+    for (int v = 0; v <= NV + 1; v++) int_idx[v] = -1;
+
+    /* boundary = neighbors of vertex 1 (cyclic_nbrs of 1) */
+    int v1_deg = FLOWER_LEN[1];
+    for (int t = 0; t < v1_deg; t++) {
+        int nb = FLOWER_THIRD[1][t];
+        bndry[nb] = 1;
+    }
+
+    int n_int = 0;
+    int *interior = (int *)xcalloc(NV + 2, sizeof(int));
+    for (int v = 2; v <= NV; v++) {
+        if (!bndry[v]) { int_idx[v] = n_int; interior[n_int++] = v; }
+    }
+
+    /* per-interior-vertex cyclic neighbor ring; reuse FLOWER_THIRD for that. */
+    int *ringlen = (int *)xcalloc(NV + 2, sizeof(int));
+    for (int i = 0; i < n_int; i++) {
+        int v = interior[i];
+        ringlen[v] = FLOWER_LEN[v];
+    }
+
+    double *xvec = (double *)xcalloc(NV + 2, sizeof(double));
+    for (int i = 0; i < n_int; i++) xvec[i] = 1.0;
+
+    /* face list excluding any face containing vertex 1 (used to enforce
+       triangle inequality during line search). */
+    int nff = 0;
+    int *ff_a = (int *)xcalloc(NF, sizeof(int));
+    int *ff_b = (int *)xcalloc(NF, sizeof(int));
+    int *ff_c = (int *)xcalloc(NF, sizeof(int));
+    for (int i = 0; i < NF; i++) {
+        int a = FACES[i][0], b = FACES[i][1], c = FACES[i][2];
+        if (a != 1 && b != 1 && c != 1) {
+            ff_a[nff] = a; ff_b[nff] = b; ff_c[nff] = c; nff++;
+        }
+    }
+
+    if (n_int == 0) goto done;
+
+    double *HJ = (double *)xcalloc((size_t)n_int * (size_t)n_int, sizeof(double));
+    double *HF = (double *)xcalloc(n_int, sizeof(double));
+    double *Hdx = (double *)xcalloc(n_int, sizeof(double));
+
+    #define U_AT(vv) (bndry[vv] ? 1.0 : xvec[int_idx[vv]])
+
+    for (int it = 0; it < 200; it++) {
+        double res = 0.0;
+        for (int i = 0; i < n_int; i++) {
+            int v = interior[i]; int k = ringlen[v]; double ui = xvec[i];
+            double s = 0.0;
+            for (int j = 0; j < k; j++) {
+                int rj = FLOWER_THIRD[v][j];
+                int rk = FLOWER_THIRD[v][(j+1) % k];
+                s += horou_petal(ui, U_AT(rj), U_AT(rk));
+            }
+            HF[i] = s - TAU;
+            double af = fabs(HF[i]); if (af > res) res = af;
+        }
+        if (res < 1e-12) break;
+
+        memset(HJ, 0, (size_t)n_int * (size_t)n_int * sizeof(double));
+        for (int i = 0; i < n_int; i++) {
+            int v = interior[i]; int k = ringlen[v]; double ui = xvec[i];
+            for (int j = 0; j < k; j++) {
+                int vj = FLOWER_THIRD[v][j];
+                int vk = FLOWER_THIRD[v][(j+1) % k];
+                double uj = U_AT(vj), uk_ = U_AT(vk);
+                double dui, duj, duk;
+                horou_petal_grad(ui, uj, uk_, &dui, &duj, &duk);
+                HJ[i*n_int + i] += dui;
+                if (int_idx[vj] >= 0) HJ[i*n_int + int_idx[vj]] += duj;
+                if (int_idx[vk] >= 0) HJ[i*n_int + int_idx[vk]] += duk;
+            }
+        }
+        for (int i = 0; i < n_int; i++) Hdx[i] = -HF[i];
+        if (horou_lu_solve(HJ, Hdx, n_int) < 0) {
+            free(HJ); free(HF); free(Hdx);
+            free(ff_a); free(ff_b); free(ff_c);
+            free(xvec); free(ringlen); free(interior); free(int_idx); free(bndry);
+            return -1;
+        }
+
+        double step = 1.0;
+        int found = 0;
+        for (int bt = 0; bt < 60; bt++, step *= 0.5) {
+            int ok = 1;
+            for (int i = 0; i < n_int; i++)
+                if (xvec[i] + step*Hdx[i] <= 0.0) { ok = 0; break; }
+            if (!ok) continue;
+            for (int f = 0; f < nff && ok; f++) {
+                #define UU(vv) (int_idx[vv] >= 0 \
+                    ? xvec[int_idx[vv]] + step*Hdx[int_idx[vv]] : 1.0)
+                double ua = UU(ff_a[f]), ub = UU(ff_b[f]), uc = UU(ff_c[f]);
+                double p = ua*ub, q = ua*uc, r = ub*uc;
+                if (p+q <= r || p+r <= q || q+r <= p) ok = 0;
+                #undef UU
+            }
+            if (!ok) continue;
+            double res2 = 0.0;
+            for (int i = 0; i < n_int; i++) {
+                int v = interior[i]; int k = ringlen[v];
+                double ui = xvec[i] + step*Hdx[i];
+                double s = 0.0;
+                for (int j = 0; j < k; j++) {
+                    int rj = FLOWER_THIRD[v][j];
+                    int rk = FLOWER_THIRD[v][(j+1) % k];
+                    double uj = (int_idx[rj] >= 0 ? xvec[int_idx[rj]] + step*Hdx[int_idx[rj]] : 1.0);
+                    double uk_ = (int_idx[rk] >= 0 ? xvec[int_idx[rk]] + step*Hdx[int_idx[rk]] : 1.0);
+                    s += horou_petal(ui, uj, uk_);
+                }
+                double af = fabs(s - TAU); if (af > res2) res2 = af;
+            }
+            if (res2 < res) { found = 1; break; }
+        }
+        if (!found) break;
+        for (int i = 0; i < n_int; i++) xvec[i] += step * Hdx[i];
+    }
+    free(HJ); free(HF); free(Hdx);
+
+    #undef U_AT
+
+done:
+    u_out[0] = NAN;
+    for (int v = 2; v <= NV; v++) {
+        u_out[v - 1] = bndry[v] ? 1.0 : xvec[int_idx[v]];
+    }
+    free(ff_a); free(ff_b); free(ff_c);
+    free(xvec); free(ringlen); free(interior); free(int_idx); free(bndry);
+    return 0;
+}
+
+/* α=0 dihedral per edge from u: bend = π − interior dihedral.
+   Adapted from src/puffup_c.c's compute_bends_at_zero. */
+static double horou_angleat(int v, int p, int q, const double u[]) {
+    double x = 1.0/u[v-1], y = 1.0/u[p-1], z = 1.0/u[q-1];
+    double cos_t = (y*y + z*z - x*x) / (2.0*y*z);
+    if (cos_t >  1.0) cos_t =  1.0;
+    if (cos_t < -1.0) cos_t = -1.0;
+    return acos(cos_t);
+}
+
+static double horou_boundaryangleat(int v, const double u[]) {
+    double tot = 0.0;
+    int k = FLOWER_LEN[v];
+    for (int t = 0; t < k; t++) {
+        /* face containing v in flower at t. We need (a,b,c) with a==v
+           (FLOWER_THIRD gives c, but we also need b). Find the face
+           explicitly via DIRECTED_FACE walk: c = FLOWER_THIRD[v][t]. The
+           corresponding face contains directed edge (v, c). */
+        int third = FLOWER_THIRD[v][t];
+        int fi = DIRECTED_FACE[v][third];
+        int a = FACES[fi][0], b = FACES[fi][1], c = FACES[fi][2];
+        if (a == 1 || b == 1 || c == 1) continue;
+        int p, q;
+        if      (v == a) { p = b; q = c; }
+        else if (v == b) { p = c; q = a; }
+        else             { p = a; q = b; }
+        tot += horou_angleat(v, p, q, u);
+    }
+    return tot;
+}
+
+static int compute_bends_at_zero(const double u[], double bend_out[]) {
+    for (int e = 0; e < NE; e++) {
+        int a = EDGE_A[e], b = EDGE_B[e];
+        int f1 = DIRECTED_FACE[a][b];
+        int f2 = DIRECTED_FACE[b][a];
+        int third1, third2;
+        {
+            int x = FACES[f1][0], y = FACES[f1][1], z = FACES[f1][2];
+            third1 = (x != a && x != b) ? x : ((y != a && y != b) ? y : z);
+        }
+        {
+            int x = FACES[f2][0], y = FACES[f2][1], z = FACES[f2][2];
+            third2 = (x != a && x != b) ? x : ((y != a && y != b) ? y : z);
+        }
+        int touches_inf_1 = (FACES[f1][0] == 1 || FACES[f1][1] == 1 || FACES[f1][2] == 1);
+        int touches_inf_2 = (FACES[f2][0] == 1 || FACES[f2][1] == 1 || FACES[f2][2] == 1);
+
+        double bend;
+        if (a == 1 || b == 1) {
+            int v = (a == 1) ? b : a;
+            bend = PI - horou_boundaryangleat(v, u);
+        } else if (!touches_inf_1 && !touches_inf_2) {
+            double pa = horou_angleat(third1, a, b, u);
+            double pd = horou_angleat(third2, a, b, u);
+            bend = PI - pa - pd;
+        } else {
+            int finite_third = touches_inf_1 ? third2 : third1;
+            bend = PI - horou_angleat(finite_third, a, b, u);
+        }
+        bend_out[e] = bend;
+    }
+    return 0;
+}
+
 /* ---------- math: matz(α) · matx(-β) -------------------------------------- */
 typedef double M3[3][3];
 
@@ -566,6 +828,7 @@ int main(int argc, char **argv) {
     int max_lm_retries = 20;
     double tiny_rel = 1e-12;
     int print_bends = 0;
+    int start_kind = 0;  /* 0 = vertexwish, 1 = ideal (horou-derived) */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--alpha") == 0 && i + 1 < argc) {
@@ -607,6 +870,12 @@ int main(int argc, char **argv) {
             if (max_lm_retries <= 0) die("--max-lm-retries must be > 0");
         }
         else if (strcmp(argv[i], "--print-bends") == 0) print_bends = 1;
+        else if (strcmp(argv[i], "--start") == 0 && i + 1 < argc) {
+            const char *s = argv[++i];
+            if      (strcmp(s, "vertexwish") == 0) start_kind = 0;
+            else if (strcmp(s, "ideal") == 0)      start_kind = 1;
+            else die("--start must be 'vertexwish' or 'ideal'");
+        }
         else die("unknown command-line option");
     }
 
@@ -614,15 +883,19 @@ int main(int argc, char **argv) {
     build_topology();
     choose_base_face();
 
-    /* vertexwish start in revolutions */
-    double *x_rev = (double *)calloc(NE, sizeof(double));
-    int sw = vertexwish_revs(x_rev);
-    if (sw) { free(x_rev); die("vertexwish failed"); }
-
-    /* convert to radians */
-    double *bend = (double *)calloc(NE, sizeof(double));
-    for (int e = 0; e < NE; e++) bend[e] = tau_const * x_rev[e];
-    free(x_rev);
+    double *bend = (double *)xcalloc(NE, sizeof(double));
+    if (start_kind == 0) {
+        double *x_rev = (double *)xcalloc(NE, sizeof(double));
+        int sw = vertexwish_revs(x_rev);
+        if (sw) { free(x_rev); die("vertexwish failed"); }
+        for (int e = 0; e < NE; e++) bend[e] = tau_const * x_rev[e];
+        free(x_rev);
+    } else {
+        double *u = (double *)xcalloc(NV + 1, sizeof(double));
+        if (horou_solve(u) < 0) { free(u); die("horou failed"); }
+        if (compute_bends_at_zero(u, bend) < 0) { free(u); die("compute_bends_at_zero failed"); }
+        free(u);
+    }
 
     double t0 = now_secs();
     LMOut out = solve_lm(alpha, bend, tol, max_iter, max_lm_retries,
@@ -632,13 +905,14 @@ int main(int argc, char **argv) {
     printf("nv: %d\n", NV);
     printf("ne: %d\n", NE);
     printf("nvar: %d\n", NVAR);
+    printf("base_face: %d %d %d\n", BASE[0], BASE[1], BASE[2]);
     printf("alpha_rad: %.17g\n", alpha);
     printf("alpha_deg: %.6f\n", alpha * 180.0 / PI);
     printf("lambda_init: %.6e\n", lambda_init);
     printf("max_iter: %d\n", max_iter);
     printf("tol: %.6e\n", tol);
     printf("solver: lm\n");
-    printf("start: vertexwish\n");
+    printf("start: %s\n", start_kind == 0 ? "vertexwish" : "ideal");
     printf("success: %s\n", out.success ? "true" : "false");
     printf("iters: %d\n", out.iters);
     printf("final_resid: %.6e\n", out.final_resid);
