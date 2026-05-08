@@ -64,6 +64,18 @@ src/puffup_c_lm_sparse: src/puffup_c_lm.c
 
 lm-sparse: src/puffup_c_lm_sparse
 
+# All-bends + quat + full-jump α-march α-carry — chunked C port of the
+# python/experiment_lm/lm_alpha_march_carry experiment. Spec:
+# docs/all_bends_quat_c_port.md. Default build is dense; sparse variant
+# links SuperLU and is the production path for the v=4..30 sweep.
+src/lm_march_c: src/lm_march_c.c
+	$(CC) $(CFLAGS) -o $@ $< -lm
+
+src/lm_march_c_sparse: src/lm_march_c.c
+	$(CC) $(CFLAGS) -DHAVE_SUPERLU $(SUPERLU_INC) -o $@ $< $(SUPERLU_LIB) -lm
+
+lm-march-sparse: src/lm_march_c_sparse
+
 src/hyperpuff_c: src/hyperpuff_c.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
