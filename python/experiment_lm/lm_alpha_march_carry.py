@@ -151,9 +151,15 @@ def main():
     ap.add_argument("--lambda-init",   type=float, default=1.0)
     ap.add_argument("--bends-out",     type=str,   default=None)
     ap.add_argument("--max-attempts",  type=int,   default=2000)
-    ap.add_argument("--sparse",        action="store_true",
+    # Sparse is the default: scales to large NVAR and matches dense to
+    # machine precision on smaller cases. Pass --no-sparse to fall back
+    # to the dense analytic Jacobian + dense linear solve (only useful
+    # for A/B comparison or environments without scipy).
+    ap.add_argument("--sparse",
+                    action=argparse.BooleanOptionalAction,
+                    default=True,
                     help="use scipy.sparse Jacobian + sparse LM solve "
-                         "(scales to large NVAR)")
+                         "(default; --no-sparse for dense)")
     args = ap.parse_args()
 
     netcode = decode(args.clers)
