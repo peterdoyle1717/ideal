@@ -44,6 +44,15 @@ try:
 except ImportError:
     _SPARSE_J_AVAILABLE = False
 
+try:
+    from quat_residual import (
+        holonomy_residual_quat, analytical_jacobian_quat_sparse,
+        branch_check_post,
+    )
+    _QUAT_AVAILABLE = True
+except ImportError:
+    _QUAT_AVAILABLE = False
+
 
 def _find_clers_bin():
     """Locate the clers decoder. Order: $CLERS_BIN, then known sibling
@@ -160,7 +169,18 @@ def main():
                     default=True,
                     help="use scipy.sparse Jacobian + sparse LM solve "
                          "(default; --no-sparse for dense)")
+    ap.add_argument("--residual", choices=("matrix", "quat"), default="matrix",
+                    help="residual backend: matrix (default; 3 off-diagonals "
+                         "of cumulative holomat) or quat (vector part of "
+                         "cumulative holonomy quaternion, analytic Jacobian)")
+    ap.add_argument("--branch-vec-tol", type=float, default=1e-6,
+                    help="quat post-check: a converged vertex has |vec(Q)| "
+                         "below this AND qw should be negative (natural "
+                         "-1 sheet for once-around loops); positive qw "
+                         "with small vec is flagged as suspect")
     args = ap.parse_args()
+    if args.residual == "quat" and not _QUAT_AVAILABLE:
+        sys.exit("ERROR: --residual quat requires python/quat_residual.py")
 
     netcode = decode(args.clers)
     faces = parse_netcode(netcode)
@@ -232,14 +252,20 @@ def main():
         bends_now.update(base_bend)
         gate = make_gate(bends_now)
 
-        F = lambda xv, a=alpha_try: holonomy_residual(
-            tri, base_face, var_edges, xv, base_bend, a)
-        if args.sparse and _SPARSE_J_AVAILABLE:
-            Jfn = lambda xv, a=alpha_try: analytical_jacobian_sparse(
+        if args.residual == "quat":
+            F = lambda xv, a=alpha_try: holonomy_residual_quat(
+                tri, base_face, var_edges, xv, base_bend, a)
+            Jfn = lambda xv, a=alpha_try: analytical_jacobian_quat_sparse(
                 tri, base_face, var_edges, xv, base_bend, a)
         else:
-            Jfn = lambda xv, a=alpha_try: analytical_jacobian(
+            F = lambda xv, a=alpha_try: holonomy_residual(
                 tri, base_face, var_edges, xv, base_bend, a)
+            if args.sparse and _SPARSE_J_AVAILABLE:
+                Jfn = lambda xv, a=alpha_try: analytical_jacobian_sparse(
+                    tri, base_face, var_edges, xv, base_bend, a)
+            else:
+                Jfn = lambda xv, a=alpha_try: analytical_jacobian(
+                    tri, base_face, var_edges, xv, base_bend, a)
 
         log = []
         out = solver_lm(F, x, tol=args.quick_tol,
@@ -282,14 +308,20 @@ def main():
 
     if target_reached:
         # Final tight LM at exactly the target.
-        F = lambda xv: holonomy_residual(
-            tri, base_face, var_edges, xv, base_bend, target)
-        if args.sparse and _SPARSE_J_AVAILABLE:
-            Jfn = lambda xv: analytical_jacobian_sparse(
+        if args.residual == "quat":
+            F = lambda xv: holonomy_residual_quat(
+                tri, base_face, var_edges, xv, base_bend, target)
+            Jfn = lambda xv: analytical_jacobian_quat_sparse(
                 tri, base_face, var_edges, xv, base_bend, target)
         else:
-            Jfn = lambda xv: analytical_jacobian(
+            F = lambda xv: holonomy_residual(
                 tri, base_face, var_edges, xv, base_bend, target)
+            if args.sparse and _SPARSE_J_AVAILABLE:
+                Jfn = lambda xv: analytical_jacobian_sparse(
+                    tri, base_face, var_edges, xv, base_bend, target)
+            else:
+                Jfn = lambda xv: analytical_jacobian(
+                    tri, base_face, var_edges, xv, base_bend, target)
         out_final = solver_lm(F, x, tol=args.final_tol,
                               max_iter=200,
                               lambda_init=args.lambda_init,
@@ -301,6 +333,23 @@ def main():
         print(f"FINAL: α={math.degrees(alpha_curr):.10f}°  "
               f"iters={out_final.iters}  resid={final_resid:.6e}  "
               f"{out_final.message}")
+
+        if args.residual == "quat":
+            # Post-convergence sanity: each vertex should have |vec(Q)| ~0
+            # AND qw on the −1 sheet (natural for once-around loops).
+            # Suspect = converged but qw > 0.
+            report = branch_check_post(tri, base_face, var_edges, x,
+                                        base_bend, target,
+                                        vec_tol=args.branch_vec_tol)
+            n_susp = sum(1 for r in report if r["suspect"])
+            print()
+            print(f"branch post-check (vec_tol={args.branch_vec_tol:.1e}):")
+            print(f"  {'v':>4}  {'qw':>14}  {'|vec(Q)|':>12}  suspect")
+            for r in report:
+                flag = "SUSPECT" if r["suspect"] else ""
+                print(f"  {r['vertex']:>4}  {r['qw']:>14.6e}  "
+                      f"{r['vec_norm']:>12.3e}  {flag}")
+            print(f"  total suspect vertices: {n_susp}")
 
         if args.bends_out:
             write_puffup_bends(args.bends_out, netcode, tri,
