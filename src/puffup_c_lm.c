@@ -522,6 +522,22 @@ static inline void movemat(double alpha, double beta, M3 M) {
     M[1][0] =  sa;  M[1][1] =  ca*cb;  M[1][2] =  ca*sb;
     M[2][0] = 0.0;  M[2][1] = -sb;     M[2][2] =  cb;
 }
+/* dM/dβ at given α,β. Lifted from canonical homotopy_stage puffup_c.c
+ * dmovemat_dbeta. d/dβ matx(-β) = -Jx · matx(-β), so
+ *   d/dβ [matz(α) · matx(-β)] = matz(α) · [[0,0,0],[0,-sb,cb],[0,-cb,-sb]]. */
+static inline void dmovemat_dbeta(double alpha, double beta, M3 D) {
+    double ca=cos(alpha), sa=sin(alpha);
+    double cb=cos(beta),  sb=sin(beta);
+    D[0][0] = 0.0;
+    D[0][1] =  sa*sb;
+    D[0][2] = -sa*cb;
+    D[1][0] = 0.0;
+    D[1][1] = -ca*sb;
+    D[1][2] =  ca*cb;
+    D[2][0] = 0.0;
+    D[2][1] = -cb;
+    D[2][2] = -sb;
+}
 
 /* ---------- residual / Jacobian ------------------------------------------- */
 static void holonomy_residual(double alpha, const double bend[], double r[]) {
@@ -544,7 +560,8 @@ static void holonomy_residual(double alpha, const double bend[], double r[]) {
 
 /* finite-difference Jacobian. J is row-major (3*N_INT) × NVAR.
    bend_tmp, r_plus, r_minus are caller-supplied scratch buffers. None
-   may alias caller's residual buffer. */
+   may alias caller's residual buffer. Kept for fallback/comparison;
+   analytical_jacobian is the production path. */
 static void fd_jacobian(double alpha, const double bend[], double *J,
                          double *bend_tmp,
                          double *r_plus, double *r_minus) {
@@ -562,6 +579,53 @@ static void fd_jacobian(double alpha, const double bend[], double *J,
         bend_tmp[e] = original;
         for (int i = 0; i < M; i++) {
             J[i * NVAR + j] = (r_plus[i] - r_minus[i]) / (2.0 * h);
+        }
+    }
+}
+
+/* Analytical Jacobian — lifted from canonical homotopy_stage puffup_c.c
+ * (functions vertex_flower_prefixes / jac_contrib_at / analytical_jacobian).
+ * Produces the same (3*N_INT) × NVAR row-major dense matrix that
+ * fd_jacobian builds, but in one pass with closed-form derivatives. */
+static void vertex_flower_prefixes(int v, double alpha, const double bend[],
+                                    int *k_out, M3 *Ms, M3 *P, M3 *S) {
+    int k = FLOWER_LEN[v];
+    *k_out = k;
+    for (int t = 0; t < k; t++) movemat(alpha, bend[FLOWER_E[v][t]], Ms[t]);
+    mat_eye(P[0]);
+    for (int t = 0; t < k; t++) matmul(P[t], Ms[t], P[t+1]);
+    mat_eye(S[k]);
+    for (int t = k-1; t >= 0; t--) matmul(Ms[t], S[t+1], S[t]);
+}
+static void jac_contrib_at(double alpha, double beta_e,
+                            const M3 P_t, const M3 S_tnext,
+                            double *v01, double *v02, double *v12) {
+    M3 dM, tmp, contrib;
+    dmovemat_dbeta(alpha, beta_e, dM);
+    matmul(P_t, dM, tmp);
+    matmul(tmp, S_tnext, contrib);
+    *v01 = contrib[0][1];
+    *v02 = contrib[0][2];
+    *v12 = contrib[1][2];
+}
+static void analytical_jacobian(double alpha, const double bend[], double *J) {
+    int rows = 3 * N_INT;
+    memset(J, 0, (size_t)rows * (size_t)NVAR * sizeof(double));
+    M3 Ms[MAXFLOWER], P[MAXFLOWER+1], S[MAXFLOWER+1];
+    for (int i = 0; i < N_INT; i++) {
+        int v = INT_VS[i];
+        int k;
+        vertex_flower_prefixes(v, alpha, bend, &k, Ms, P, S);
+        for (int t = 0; t < k; t++) {
+            int e = FLOWER_E[v][t];
+            int col = VAR_OF_E[e];
+            if (col < 0) continue;
+            double v01, v02, v12;
+            jac_contrib_at(alpha, bend[e], P[t], S[t+1], &v01, &v02, &v12);
+            int row = 3 * i;
+            J[(row+0)*NVAR + col] += v01;
+            J[(row+1)*NVAR + col] += v02;
+            J[(row+2)*NVAR + col] += v12;
         }
     }
 }
@@ -723,8 +787,9 @@ static LMOut solve_lm(double alpha, double bend_full[],
             out.success = true; out.iters = it; out.final_resid = norm;
             out.final_lambda = lam; out.msg = "tol"; goto done;
         }
-        /* J = ∂r/∂x via FD. r_tmp_a/b are scratch; do not alias r. */
-        fd_jacobian(alpha, bend_full, J, bend_tmp, r_tmp_a, r_tmp_b);
+        /* J = ∂r/∂x analytical (lifted from canonical homotopy_stage). */
+        analytical_jacobian(alpha, bend_full, J);
+        (void)bend_tmp; (void)r_tmp_a; (void)r_tmp_b;  /* unused now; kept allocated for ABI continuity */
         /* A = J^T J, g = J^T r */
         for (int i = 0; i < N; i++) for (int j = 0; j < N; j++) {
             double s = 0;
@@ -828,6 +893,7 @@ int main(int argc, char **argv) {
     int max_lm_retries = 20;
     double tiny_rel = 1e-12;
     int print_bends = 0;
+    const char *bends_out = NULL;
     int start_kind = 0;  /* 0 = vertexwish, 1 = ideal (horou-derived) */
 
     for (int i = 1; i < argc; i++) {
@@ -870,6 +936,9 @@ int main(int argc, char **argv) {
             if (max_lm_retries <= 0) die("--max-lm-retries must be > 0");
         }
         else if (strcmp(argv[i], "--print-bends") == 0) print_bends = 1;
+        else if (strcmp(argv[i], "--bends-out") == 0 && i + 1 < argc) {
+            bends_out = argv[++i];
+        }
         else if (strcmp(argv[i], "--start") == 0 && i + 1 < argc) {
             const char *s = argv[++i];
             if      (strcmp(s, "vertexwish") == 0) start_kind = 0;
@@ -924,6 +993,80 @@ int main(int argc, char **argv) {
     if (print_bends) {
         for (int e = 0; e < NE; e++) {
             printf("bend %d-%d %.17g\n", EDGE_A[e], EDGE_B[e], bend[e]);
+        }
+    }
+
+    /* puffup-bends 1 writer — matches canonical homotopy_stage format
+     * so euclid_realize can consume the file. Emits faces in input
+     * order. Bends must be in canonical homotopy_stage edge order
+     * (`for u=1..NV walk NBR[u] in nbr_add insertion order, emit (u,w)
+     * iff u<w`). puffup_c_lm.c's EDGE_A/EDGE_B array is in face-scan
+     * encounter order, which differs in general — so we rebuild the
+     * canonical order locally. */
+    if (bends_out) {
+        FILE *fh = fopen(bends_out, "w");
+        if (!fh) {
+            fprintf(stderr, "ERROR: cannot open --bends-out %s\n", bends_out);
+        } else {
+            /* canonical-order rebuild */
+            static int canon_nbr[MAXV+1][MAXFLOWER];
+            static int canon_nnbr[MAXV+1];
+            static char canon_seen[MAXV+1][MAXV+1];
+            memset(canon_nnbr, 0, sizeof(canon_nnbr));
+            memset(canon_seen, 0, sizeof(canon_seen));
+            #define CANON_ADD(u,w) do { \
+                if (!canon_seen[(u)][(w)]) { \
+                    canon_nbr[(u)][canon_nnbr[(u)]++] = (w); \
+                    canon_seen[(u)][(w)] = 1; \
+                } \
+            } while (0)
+            for (int i = 0; i < NF; i++) {
+                int a = FACES[i][0], b = FACES[i][1], c = FACES[i][2];
+                CANON_ADD(a,b); CANON_ADD(b,a);
+                CANON_ADD(b,c); CANON_ADD(c,b);
+                CANON_ADD(a,c); CANON_ADD(c,a);
+            }
+            #undef CANON_ADD
+
+            fprintf(fh, "puffup-bends 1\n");
+            fprintf(fh, "NV %d NE %d alpha_deg %.15g\n",
+                    NV, NE, alpha * 180.0 / PI);
+            fprintf(fh, "faces ");
+            for (int i = 0; i < NF; i++) {
+                fprintf(fh, "%d,%d,%d%s",
+                        FACES[i][0], FACES[i][1], FACES[i][2],
+                        i + 1 < NF ? ";" : "");
+            }
+            fprintf(fh, "\n");
+            fprintf(fh, "bends\n");
+            int rows = 0;
+            for (int u = 1; u <= NV; u++) {
+                for (int j = 0; j < canon_nnbr[u]; j++) {
+                    int w = canon_nbr[u][j];
+                    if (u < w) {
+                        int e = EDGE_IDX_LOOKUP[u][w];
+                        if (e < 0) {
+                            fprintf(stderr,
+                                "ERROR: --bends-out: edge (%d,%d) has no index\n",
+                                u, w);
+                            fclose(fh);
+                            free(bend);
+                            return 1;
+                        }
+                        fprintf(fh, "%d %d %.15g\n", u, w, bend[e]);
+                        rows++;
+                    }
+                }
+            }
+            if (rows != NE) {
+                fprintf(stderr,
+                    "ERROR: --bends-out emitted %d rows, expected NE=%d\n",
+                    rows, NE);
+                fclose(fh);
+                free(bend);
+                return 1;
+            }
+            fclose(fh);
         }
     }
 
