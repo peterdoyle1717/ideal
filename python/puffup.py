@@ -269,7 +269,7 @@ def solver_lm(fun, x0: np.ndarray, tol: float = 1e-12, max_iter: int = 60,
               lambda_up: float = 10.0, lambda_max: float = 1e12,
               max_lm_retries: int = 20, tiny_rel: float = 1e-12,
               iter_log: Optional[List[dict]] = None,
-              trial_gate=None) -> NewtonOut:
+              trial_gate=None, jacobian=None) -> NewtonOut:
     """Levenberg–Marquardt with Marquardt scaling D = diag(J^T J).
 
     LM step: solve (A + lambda * diag(D)) @ delta = -g, A = J^T J, g = J^T r.
@@ -281,6 +281,11 @@ def solver_lm(fun, x0: np.ndarray, tol: float = 1e-12, max_iter: int = 60,
     (e.g. dent-free check on reconstructed bends). Returning False rejects
     the trial as if residual had increased — lambda goes up, x stays put,
     retry. Trial dent rejections counted separately in iter_log.
+
+    jacobian(x) -> ndarray: optional caller-supplied analytical Jacobian.
+    If None, falls back to fd_jacobian (forward differences with default
+    step h = 1e-7). Pass an analytical Jacobian (e.g. from
+    jacobian.analytical_jacobian) to remove the FD noise floor.
     """
     x = np.array(x0, float)
     r = fun(x)
@@ -289,7 +294,7 @@ def solver_lm(fun, x0: np.ndarray, tol: float = 1e-12, max_iter: int = 60,
     for it in range(max_iter):
         if norm <= tol:
             return NewtonOut(x, r, True, it, "tol")
-        J = fd_jacobian(fun, x)
+        J = jacobian(x) if jacobian is not None else fd_jacobian(fun, x)
         A = J.T @ J
         g = J.T @ r
         diagA = np.diag(A).copy()

@@ -20,6 +20,7 @@ Output:
 import argparse
 import json
 import math
+import os
 import subprocess
 import sys
 import time
@@ -36,8 +37,32 @@ from puffup import (
     parse_netcode, edge_key, Tri,
     holonomy_residual, vertex_turn, solver_lm,
 )
+from jacobian import analytical_jacobian
 
-CLERS_BIN = "/Users/doyle/Dropbox/neo/clers/bin/clers"
+
+def _find_clers_bin():
+    """Locate the clers decoder. Order: $CLERS_BIN, then known sibling
+    paths on laptop (Dropbox layout) and doob (~/neo/clers). Fail
+    clearly rather than at first subprocess call if none is found."""
+    env = os.environ.get("CLERS_BIN")
+    if env and Path(env).is_file():
+        return env
+    home = Path.home()
+    candidates = [
+        home / "Dropbox/neo/clers/bin/clers",
+        home / "neo/clers/bin/clers",
+        home / "Dropbox/neo/orchestrator/tools/clers/bin/clers",
+        home / "neo/orchestrator/tools/clers/bin/clers",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return str(p)
+    raise FileNotFoundError(
+        "clers decoder not found; set $CLERS_BIN or build "
+        "{Dropbox/,~/}/neo/clers")
+
+
+CLERS_BIN = _find_clers_bin()
 
 
 def decode(clers: str) -> str:
@@ -195,12 +220,15 @@ def main():
 
         F = lambda xv, a=alpha_try: holonomy_residual(
             tri, base_face, var_edges, xv, base_bend, a)
+        Jfn = lambda xv, a=alpha_try: analytical_jacobian(
+            tri, base_face, var_edges, xv, base_bend, a)
 
         log = []
         out = solver_lm(F, x, tol=args.quick_tol,
                         max_iter=args.max_quick_iter,
                         lambda_init=args.lambda_init,
-                        iter_log=log, trial_gate=gate)
+                        iter_log=log, trial_gate=gate,
+                        jacobian=Jfn)
         l_max = max((r["lambda"] for r in log), default=args.lambda_init)
         resid = float(np.linalg.norm(out.residual))
         n_step += 1
@@ -238,9 +266,12 @@ def main():
         # Final tight LM at exactly the target.
         F = lambda xv: holonomy_residual(
             tri, base_face, var_edges, xv, base_bend, target)
+        Jfn = lambda xv: analytical_jacobian(
+            tri, base_face, var_edges, xv, base_bend, target)
         out_final = solver_lm(F, x, tol=args.final_tol,
                               max_iter=200,
-                              lambda_init=args.lambda_init)
+                              lambda_init=args.lambda_init,
+                              jacobian=Jfn)
         x = out_final.x
         alpha_curr = target
         final_resid = float(np.linalg.norm(out_final.residual))
