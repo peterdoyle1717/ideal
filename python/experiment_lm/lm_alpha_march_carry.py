@@ -38,6 +38,11 @@ from puffup import (
     holonomy_residual, vertex_turn, solver_lm,
 )
 from jacobian import analytical_jacobian
+try:
+    from jacobian_sparse import analytical_jacobian_sparse
+    _SPARSE_J_AVAILABLE = True
+except ImportError:
+    _SPARSE_J_AVAILABLE = False
 
 
 def _find_clers_bin():
@@ -146,6 +151,9 @@ def main():
     ap.add_argument("--lambda-init",   type=float, default=1.0)
     ap.add_argument("--bends-out",     type=str,   default=None)
     ap.add_argument("--max-attempts",  type=int,   default=2000)
+    ap.add_argument("--sparse",        action="store_true",
+                    help="use scipy.sparse Jacobian + sparse LM solve "
+                         "(scales to large NVAR)")
     args = ap.parse_args()
 
     netcode = decode(args.clers)
@@ -220,8 +228,12 @@ def main():
 
         F = lambda xv, a=alpha_try: holonomy_residual(
             tri, base_face, var_edges, xv, base_bend, a)
-        Jfn = lambda xv, a=alpha_try: analytical_jacobian(
-            tri, base_face, var_edges, xv, base_bend, a)
+        if args.sparse and _SPARSE_J_AVAILABLE:
+            Jfn = lambda xv, a=alpha_try: analytical_jacobian_sparse(
+                tri, base_face, var_edges, xv, base_bend, a)
+        else:
+            Jfn = lambda xv, a=alpha_try: analytical_jacobian(
+                tri, base_face, var_edges, xv, base_bend, a)
 
         log = []
         out = solver_lm(F, x, tol=args.quick_tol,
@@ -266,8 +278,12 @@ def main():
         # Final tight LM at exactly the target.
         F = lambda xv: holonomy_residual(
             tri, base_face, var_edges, xv, base_bend, target)
-        Jfn = lambda xv: analytical_jacobian(
-            tri, base_face, var_edges, xv, base_bend, target)
+        if args.sparse and _SPARSE_J_AVAILABLE:
+            Jfn = lambda xv: analytical_jacobian_sparse(
+                tri, base_face, var_edges, xv, base_bend, target)
+        else:
+            Jfn = lambda xv: analytical_jacobian(
+                tri, base_face, var_edges, xv, base_bend, target)
         out_final = solver_lm(F, x, tol=args.final_tol,
                               max_iter=200,
                               lambda_init=args.lambda_init,

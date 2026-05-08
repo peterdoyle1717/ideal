@@ -287,6 +287,16 @@ def solver_lm(fun, x0: np.ndarray, tol: float = 1e-12, max_iter: int = 60,
     step h = 1e-7). Pass an analytical Jacobian (e.g. from
     jacobian.analytical_jacobian) to remove the FD noise floor.
     """
+    # Lazy-import scipy.sparse so the FD-only / dense-only callers don't pay
+    # the import cost.
+    try:
+        import scipy.sparse as _sp
+        import scipy.sparse.linalg as _sla
+        _SPARSE_OK = True
+    except ImportError:
+        _sp = None; _sla = None
+        _SPARSE_OK = False
+
     x = np.array(x0, float)
     r = fun(x)
     norm = float(np.linalg.norm(r))
@@ -295,16 +305,26 @@ def solver_lm(fun, x0: np.ndarray, tol: float = 1e-12, max_iter: int = 60,
         if norm <= tol:
             return NewtonOut(x, r, True, it, "tol")
         J = jacobian(x) if jacobian is not None else fd_jacobian(fun, x)
-        A = J.T @ J
-        g = J.T @ r
-        diagA = np.diag(A).copy()
+        is_sparse = _SPARSE_OK and _sp.issparse(J)
+        if is_sparse:
+            # CSC normal-equation matrix; scipy returns CSR for J.T @ J on
+            # CSC input — convert once. g comes out 1-D ndarray when r is.
+            A = (J.T @ J).tocsc()
+            g = np.asarray(J.T @ r).ravel()
+            diagA = A.diagonal().copy()
+        else:
+            A = J.T @ J
+            g = J.T @ r
+            diagA = np.diag(A).copy()
         if diagA.size > 0:
             floor = max(tiny_rel * float(np.max(diagA)), 1e-30)
             D = np.maximum(diagA, floor)
         else:
             D = diagA
         cond_J = float("nan")
-        if iter_log is not None and J.size:
+        # cond(J) is dense-only — skip in the sparse path. Iter logs still
+        # record nan for sparse runs; that matches the prior dense-fail path.
+        if iter_log is not None and not is_sparse and J.size:
             try:
                 cond_J = float(np.linalg.cond(J))
             except Exception:
@@ -315,8 +335,14 @@ def solver_lm(fun, x0: np.ndarray, tol: float = 1e-12, max_iter: int = 60,
         retries_dent = 0
         for _ in range(max_lm_retries):
             try:
-                delta = np.linalg.solve(A + lam * np.diag(D), -g)
-            except np.linalg.LinAlgError:
+                if is_sparse:
+                    M = A + _sp.diags(lam * D, format="csc")
+                    delta = _sla.spsolve(M, -g)
+                    if not np.all(np.isfinite(delta)):
+                        raise np.linalg.LinAlgError("non-finite spsolve")
+                else:
+                    delta = np.linalg.solve(A + lam * np.diag(D), -g)
+            except (np.linalg.LinAlgError, RuntimeError):
                 retries_lin += 1
                 lam = min(lam * lambda_up, lambda_max)
                 if lam >= lambda_max:
