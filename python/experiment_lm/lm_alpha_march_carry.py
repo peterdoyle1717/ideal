@@ -184,6 +184,16 @@ def main():
                          "below this AND qw should be negative (natural "
                          "-1 sheet for once-around loops); positive qw "
                          "with small vec is flagged as suspect")
+    ap.add_argument("--alpha-jump-policy", choices=("half", "full"),
+                    default="half",
+                    help="α-march cap: half (default; cap = gap/2, then "
+                         "halve on failure) or full (experiment; cap = "
+                         "gap/1 = full jump to target, then halve on "
+                         "failure to gap/2, gap/4, …)")
+    ap.add_argument("--quick-min-drop", type=float, default=1e-2,
+                    help="full-policy quick-reject: accept iff residual "
+                         "≤ quick_tol OR final ≤ quick_min_drop × initial "
+                         "(default 1e-2 = 100× shrink)")
     args = ap.parse_args()
     if args.residual == "quat" and not _QUAT_AVAILABLE:
         sys.exit("ERROR: --residual quat requires python/quat_residual.py")
@@ -260,27 +270,47 @@ def main():
             print(f"J probe failed: {e!r}")
     print(f"target={args.target_deg}°  init_step={args.init_step_deg}°  "
           f"min_step={args.min_step_deg}°  λ_init={args.lambda_init}  "
-          f"max_quick_iter={args.max_quick_iter}  quick_tol={args.quick_tol}")
+          f"max_quick_iter={args.max_quick_iter}  quick_tol={args.quick_tol}  "
+          f"jump={args.alpha_jump_policy}")
     print()
-    print(f"  {'#':>4}  {'α°':>9}  {'try°':>9}  {'iters':>5}  "
-          f"{'resid':>11}  {'λ_max':>10}  {'verdict':>7}")
-    print(f"  {'-':>4}  {'-':>9}  {'-':>9}  {'-':>5}  "
-          f"{'-':>11}  {'-':>10}  {'-':>7}")
+    print(f"  {'#':>4}  {'α°':>9}  {'try°':>9}  {'frac':>6}  "
+          f"{'iters':>5}  {'r_in':>10}  {'r_out':>10}  "
+          f"{'λ_max':>10}  {'verdict':>7}")
+    print(f"  {'-':>4}  {'-':>9}  {'-':>9}  {'-':>6}  {'-':>5}  "
+          f"{'-':>10}  {'-':>10}  {'-':>10}  {'-':>7}")
 
     alpha_curr = 0.0
     n_step = 0
     n_retreat = 0
+    n_attempts = 0
     final_resid = float("inf")
     history = []
     target_reached = False
+    accepted_frac_seq = []
+    rejected_frac_seq = []
+    alpha_seq = []
+    first_attempt_fraction = None
+    accepted_first_fraction = None
+
+    cap_fraction = 1.0 if args.alpha_jump_policy == "full" else 0.5
+    try_fraction = cap_fraction
+    # Legacy half-policy controller uses an absolute angular `step` that
+    # halves on failure and gets capped at gap/2 each iteration. The
+    # full-jump experiment uses a pure fraction-of-gap controller that
+    # halves on failure and resets to cap_fraction (= 1.0) on accept.
 
     t_start = time.monotonic()
     for attempt in range(args.max_attempts):
         if alpha_curr >= alpha_final:
             target_reached = True
             break
-        cap = (target - alpha_curr) * 0.5
-        used = min(step, cap)
+        gap = target - alpha_curr
+        if args.alpha_jump_policy == "full":
+            used = gap * try_fraction
+        else:
+            cap = gap * 0.5
+            used = min(step, cap)
+            try_fraction = used / gap   # for stats
         alpha_try = alpha_curr + used
 
         bends_now = {e: float(b) for e, b in zip(var_edges, x)}
@@ -304,6 +334,13 @@ def main():
                 Jfn = lambda xv, a=alpha_try: analytical_jacobian(
                     tri, base_face, var_edges, xv, base_bend, a)
 
+        # Stale-bend residual at the new α — the LM's input residual.
+        # Used for the full-policy "must shrink by quick_min_drop" test.
+        try:
+            initial_resid = float(np.linalg.norm(F(x)))
+        except Exception:
+            initial_resid = float("nan")
+
         log = []
         out = solver_lm(F, x, tol=args.quick_tol,
                         max_iter=args.max_quick_iter,
@@ -313,19 +350,37 @@ def main():
         l_max = max((r["lambda"] for r in log), default=args.lambda_init)
         resid = float(np.linalg.norm(out.residual))
         n_step += 1
-        # accept iff LM said success AND residual is below quick_tol —
-        # LM declares success as soon as |r| <= tol within max_iter,
-        # but if it bailed at max_iter it may still be 'success=False'.
-        accepted = bool(out.success and resid < args.quick_tol)
-        verdict = "ok" if accepted else "halve"
+        n_attempts += 1
+        if first_attempt_fraction is None:
+            first_attempt_fraction = try_fraction
+
+        # Acceptance:
+        # half:  legacy — out.success AND resid < quick_tol.
+        # full:  resid ≤ quick_tol OR resid ≤ quick_min_drop × initial_resid
+        #        (fast-path for big jumps that drop a lot but not yet to
+        #        the quick_tol floor; LM at the next α step takes them
+        #        the rest of the way). No out.success requirement: a big
+        #        jump that drops residual by ≥100× already counts as
+        #        forward progress regardless of LM's tol-based "success".
+        if args.alpha_jump_policy == "full":
+            denom = max(initial_resid, 1e-30) if initial_resid == initial_resid else 1.0
+            accepted_tol  = bool(resid <= args.quick_tol)
+            accepted_drop = bool(resid <= args.quick_min_drop * denom)
+            accepted = accepted_tol or accepted_drop
+        else:
+            accepted = bool(out.success and resid < args.quick_tol)
+        verdict = "ok" if accepted else "retreat"
         print(f"  {n_step:>4}  {math.degrees(alpha_curr):>9.4f}  "
-              f"{math.degrees(alpha_try):>9.4f}  {out.iters:>5}  "
-              f"{resid:>11.3e}  {l_max:>10.2e}  {verdict:>7}")
+              f"{math.degrees(alpha_try):>9.4f}  {try_fraction:>6.3f}  "
+              f"{out.iters:>5}  {initial_resid:>10.3e}  {resid:>10.3e}  "
+              f"{l_max:>10.2e}  {verdict:>7}")
         history.append({
             "step": n_step,
             "alpha_curr_deg": math.degrees(alpha_curr),
             "alpha_try_deg":  math.degrees(alpha_try),
+            "fraction": try_fraction,
             "iters":  int(out.iters),
+            "initial_resid": initial_resid,
             "resid":  resid,
             "lambda_max": l_max,
             "verdict": verdict,
@@ -334,14 +389,37 @@ def main():
         if accepted:
             x = out.x
             alpha_curr = alpha_try
-            # step does NOT grow on success — match canonical controller.
+            accepted_frac_seq.append(try_fraction)
+            alpha_seq.append(math.degrees(alpha_curr))
+            if accepted_first_fraction is None:
+                accepted_first_fraction = try_fraction
+            if args.alpha_jump_policy == "full":
+                try_fraction = cap_fraction          # reset
+            # else: legacy step does NOT grow on success.
         else:
-            step *= 0.5
+            rejected_frac_seq.append(try_fraction)
             n_retreat += 1
-            if step < min_step:
-                print(f"  STEP UNDERFLOW (alpha_step < {args.min_step_deg}°) "
-                      f"at α={math.degrees(alpha_curr):.6f}°")
-                break
+            if args.alpha_jump_policy == "full":
+                try_fraction *= 0.5
+                if try_fraction * gap < min_step:
+                    print(f"  FRACTION UNDERFLOW "
+                          f"(fraction*gap < {args.min_step_deg}°) "
+                          f"at α={math.degrees(alpha_curr):.6f}°")
+                    break
+            else:
+                step *= 0.5
+                if step < min_step:
+                    print(f"  STEP UNDERFLOW "
+                          f"(alpha_step < {args.min_step_deg}°) "
+                          f"at α={math.degrees(alpha_curr):.6f}°")
+                    break
+
+    # Catch the edge case where the for-loop exhausts max_attempts on
+    # the same iteration that reached alpha_final: the top-of-loop guard
+    # never fired, but alpha_curr is at target. The final tight LM still
+    # belongs.
+    if alpha_curr >= alpha_final:
+        target_reached = True
 
     if target_reached:
         # Final tight LM at exactly the target.
@@ -411,9 +489,41 @@ def main():
             status = "LAMBDA_SATURATED_POSITIVE_RESIDUAL"
         else:
             status = "STALLED_POSITIVE_RESIDUAL"
+
+    # Did the very first try go straight to alpha=60 and succeed?
+    first_jump_to_target = False
+    if (first_attempt_fraction is not None and
+            abs(first_attempt_fraction - 1.0) < 1e-12 and
+            accepted_first_fraction is not None and
+            abs(accepted_first_fraction - 1.0) < 1e-12 and
+            target_reached):
+        first_jump_to_target = True
+
+    # Retreats before the first accept (= rejects until first accept).
+    retreats_before_first_accept = 0
+    for h in history:
+        if h["verdict"] == "ok":
+            break
+        retreats_before_first_accept += 1
+
+    accepted_seq_str = ",".join(f"{f:.6g}" for f in accepted_frac_seq) or "-"
+    rejected_seq_str = ",".join(f"{f:.6g}" for f in rejected_frac_seq) or "-"
+    alpha_seq_str = ",".join(f"{a:.6g}" for a in alpha_seq) or "-"
+    max_attempt_fraction = max([f for f in (accepted_frac_seq +
+                                             rejected_frac_seq)] or [0.0])
+
     print(f"summary: clers={args.clers} target_reached={target_reached} "
-          f"steps={n_step} retreats={n_retreat} "
-          f"final_resid={final_resid:.6e} wall={wall:.2f}s status={status}")
+          f"steps={n_step} retreats={n_retreat} attempts={n_attempts} "
+          f"final_resid={final_resid:.6e} wall={wall:.2f}s "
+          f"status={status} policy={args.alpha_jump_policy} "
+          f"first_jump_to_target={first_jump_to_target} "
+          f"retreats_before_first_accept={retreats_before_first_accept} "
+          f"first_attempt_fraction={first_attempt_fraction!s} "
+          f"accepted_first_fraction={accepted_first_fraction!s} "
+          f"max_attempt_fraction={max_attempt_fraction:.6g}")
+    print(f"stats: accepted_fraction_seq={accepted_seq_str}")
+    print(f"stats: rejected_fraction_seq={rejected_seq_str}")
+    print(f"stats: alpha_seq_deg={alpha_seq_str}")
 
 
 if __name__ == "__main__":
