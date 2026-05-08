@@ -60,6 +60,21 @@ static int INT_VS[MAXV];
 
 static double tau_const;     /* 2 π */
 
+#ifdef HAVE_SUPERLU
+#include <slu_ddefs.h>
+#endif
+
+/* Solver path selection. SOLVER_DENSE: dense home-grown LU, no extra deps.
+ * SOLVER_SPARSE: sparse SuperLU dgssv on the LM normal equations
+ * (A + λD), with A = J^T J formed directly from per-vertex flower
+ * contributions (skip forming sparse J entirely). */
+enum { SOLVER_DENSE = 0, SOLVER_SPARSE = 1 };
+#ifdef HAVE_SUPERLU
+static int CFG_SOLVER = SOLVER_SPARSE;
+#else
+static int CFG_SOLVER = SOLVER_DENSE;
+#endif
+
 static void die(const char *msg) { fprintf(stderr, "error: %s\n", msg); exit(2); }
 
 static void *xcalloc(size_t n, size_t sz) {
@@ -630,6 +645,256 @@ static void analytical_jacobian(double alpha, const double bend[], double *J) {
     }
 }
 
+#ifdef HAVE_SUPERLU
+/* ---------- sparse LM: A = J^T J as CSC, accumulated per vertex --------- *
+ *
+ * For each interior vertex i with flower of size k, jac_contrib_at gives
+ * three doubles (v01[s], v02[s], v12[s]) per flower position s. This
+ * vertex contributes to A:
+ *   A[c_s, c_t] += v01[s]*v01[t] + v02[s]*v02[t] + v12[s]*v12[t]
+ * for every (s, t) where c_s = VAR_OF_E[FLOWER_E[v][s]] >= 0 and
+ * c_t = VAR_OF_E[FLOWER_E[v][t]] >= 0.
+ *
+ * And to g = J^T r:
+ *   g[c_s] += v01[s]*r[3i+0] + v02[s]*r[3i+1] + v12[s]*r[3i+2].
+ *
+ * The CSC pattern of A is fixed once the topology is built; we cache it
+ * plus per-(i,s,t) offsets into S_val_A so the per-iter fill is O(NVAR)
+ * with small constants. */
+static int_t  *SLA_colptr = NULL;            /* size NVAR+1                          */
+static int_t  *SLA_rowidx = NULL;            /* size SLA_NNZ                         */
+static double *SLA_val    = NULL;            /* size SLA_NNZ (values, refilled/iter) */
+static double *SLA_val_pl = NULL;            /* size SLA_NNZ (A + λD scratch)        */
+static int_t   SLA_NNZ    = 0;
+static int_t  *SLA_diag_pos = NULL;          /* size NVAR; offset of A[c,c] in SLA_val (-1 if absent) */
+static int_t  *SLA_off_st = NULL;            /* size N_INT * MAXFLOWER * MAXFLOWER; -1 if base or absent */
+static int    *SLA_perm_c = NULL;
+static int    *SLA_perm_r = NULL;
+static int     SLA_setup_done = 0;
+
+static void sparse_lm_free(void) {
+    free(SLA_colptr); SLA_colptr = NULL;
+    free(SLA_rowidx); SLA_rowidx = NULL;
+    free(SLA_val);    SLA_val = NULL;
+    free(SLA_val_pl); SLA_val_pl = NULL;
+    free(SLA_diag_pos); SLA_diag_pos = NULL;
+    free(SLA_off_st); SLA_off_st = NULL;
+    if (SLA_perm_c) { SUPERLU_FREE(SLA_perm_c); SLA_perm_c = NULL; }
+    if (SLA_perm_r) { SUPERLU_FREE(SLA_perm_r); SLA_perm_r = NULL; }
+    SLA_NNZ = 0;
+    SLA_setup_done = 0;
+}
+
+/* Insert `row` into col_rows[col] keeping each col list sorted unique.
+ * Static helper so the build doesn't rely on GCC nested-function ext. */
+static int **g_col_rows;
+static int  *g_col_cap;
+static int  *g_col_len;
+
+static void sla_insert_row(int col, int row) {
+    int n = g_col_len[col];
+    int lo = 0, hi = n;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (g_col_rows[col][mid] < row) lo = mid + 1; else hi = mid;
+    }
+    if (lo < n && g_col_rows[col][lo] == row) return;
+    if (n + 1 > g_col_cap[col]) {
+        int newcap = g_col_cap[col] ? g_col_cap[col] * 2 : 8;
+        g_col_rows[col] = (int *)realloc(g_col_rows[col],
+                                         (size_t)newcap * sizeof(int));
+        if (!g_col_rows[col]) die("realloc col_rows");
+        g_col_cap[col] = newcap;
+    }
+    for (int p = n; p > lo; p--) g_col_rows[col][p] = g_col_rows[col][p-1];
+    g_col_rows[col][lo] = row;
+    g_col_len[col] = n + 1;
+}
+
+/* Build A's CSC pattern + per-(i,s,t) offset table. */
+static int sparse_lm_setup(void) {
+    sparse_lm_free();
+
+    g_col_rows = (int **)xcalloc((size_t)NVAR, sizeof(int *));
+    g_col_cap  = (int  *)xcalloc((size_t)NVAR, sizeof(int));
+    g_col_len  = (int  *)xcalloc((size_t)NVAR, sizeof(int));
+
+    for (int i = 0; i < N_INT; i++) {
+        int v = INT_VS[i];
+        int k = FLOWER_LEN[v];
+        for (int s = 0; s < k; s++) {
+            int es = FLOWER_E[v][s];
+            int cs = VAR_OF_E[es];
+            if (cs < 0) continue;
+            for (int t = 0; t < k; t++) {
+                int et = FLOWER_E[v][t];
+                int ct = VAR_OF_E[et];
+                if (ct < 0) continue;
+                sla_insert_row(ct, cs);   /* A[cs, ct] => CSC column ct, row cs */
+            }
+        }
+    }
+
+    /* Build CSC arrays. */
+    SLA_colptr = (int_t *)xcalloc((size_t)NVAR + 1, sizeof(int_t));
+    int_t total = 0;
+    for (int c = 0; c < NVAR; c++) {
+        SLA_colptr[c] = total;
+        total += g_col_len[c];
+    }
+    SLA_colptr[NVAR] = total;
+    SLA_NNZ = total;
+    SLA_rowidx = (int_t *)xcalloc((size_t)SLA_NNZ, sizeof(int_t));
+    SLA_val    = (double *)xcalloc((size_t)SLA_NNZ, sizeof(double));
+    SLA_val_pl = (double *)xcalloc((size_t)SLA_NNZ, sizeof(double));
+    for (int c = 0; c < NVAR; c++) {
+        int_t off = SLA_colptr[c];
+        for (int j = 0; j < g_col_len[c]; j++) {
+            SLA_rowidx[off + j] = g_col_rows[c][j];
+        }
+    }
+    /* Diagonal positions */
+    SLA_diag_pos = (int_t *)xcalloc((size_t)NVAR, sizeof(int_t));
+    for (int c = 0; c < NVAR; c++) {
+        SLA_diag_pos[c] = -1;
+        int lo = SLA_colptr[c], hi = SLA_colptr[c+1];
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (SLA_rowidx[mid] < c) lo = mid + 1; else hi = mid;
+        }
+        if (lo < SLA_colptr[c+1] && SLA_rowidx[lo] == c) SLA_diag_pos[c] = lo;
+    }
+
+    /* Per-(i, s, t) offset into SLA_val. */
+    SLA_off_st = (int_t *)xcalloc((size_t)N_INT * MAXFLOWER * MAXFLOWER, sizeof(int_t));
+    for (size_t z = 0; z < (size_t)N_INT * MAXFLOWER * MAXFLOWER; z++) SLA_off_st[z] = -1;
+    for (int i = 0; i < N_INT; i++) {
+        int v = INT_VS[i];
+        int k = FLOWER_LEN[v];
+        for (int s = 0; s < k; s++) {
+            int cs = VAR_OF_E[FLOWER_E[v][s]];
+            if (cs < 0) continue;
+            for (int t = 0; t < k; t++) {
+                int ct = VAR_OF_E[FLOWER_E[v][t]];
+                if (ct < 0) continue;
+                /* Find position of A[cs, ct] in SLA_val: column ct, row cs. */
+                int lo = SLA_colptr[ct], hi = SLA_colptr[ct+1];
+                while (lo < hi) {
+                    int mid = (lo + hi) / 2;
+                    if (SLA_rowidx[mid] < cs) lo = mid + 1; else hi = mid;
+                }
+                SLA_off_st[((size_t)i * MAXFLOWER + s) * MAXFLOWER + t] = lo;
+            }
+        }
+    }
+
+    for (int c = 0; c < NVAR; c++) free(g_col_rows[c]);
+    free(g_col_rows); free(g_col_cap); free(g_col_len);
+    g_col_rows = NULL; g_col_cap = NULL; g_col_len = NULL;
+
+    /* Compute column ordering once on the pattern (values irrelevant). */
+    for (int_t i = 0; i < SLA_NNZ; i++) SLA_val[i] = 1.0;
+    SuperMatrix Apat;
+    dCreate_CompCol_Matrix(&Apat, NVAR, NVAR, SLA_NNZ,
+                            SLA_val, SLA_rowidx, SLA_colptr,
+                            SLU_NC, SLU_D, SLU_GE);
+    SLA_perm_c = intMalloc(NVAR);
+    SLA_perm_r = intMalloc(NVAR);
+    if (!SLA_perm_c || !SLA_perm_r) {
+        Destroy_SuperMatrix_Store(&Apat);
+        sparse_lm_free();
+        return -1;
+    }
+    /* COLAMD = 1; MMD_AT_PLUS_A = 3 (good for symmetric A). */
+    get_perm_c(3, &Apat, SLA_perm_c);
+    Destroy_SuperMatrix_Store(&Apat);
+
+    SLA_setup_done = 1;
+    return 0;
+}
+
+/* Per-iter: zero SLA_val and g, accumulate per-vertex contributions. */
+static void sparse_lm_AtA_fill(double alpha, const double *bend,
+                                const double *r, double *g) {
+    memset(SLA_val, 0, (size_t)SLA_NNZ * sizeof(double));
+    memset(g, 0, (size_t)NVAR * sizeof(double));
+
+    M3 Ms[MAXFLOWER], P[MAXFLOWER+1], S[MAXFLOWER+1];
+    double v01[MAXFLOWER], v02[MAXFLOWER], v12[MAXFLOWER];
+    int    cs_arr[MAXFLOWER];
+
+    for (int i = 0; i < N_INT; i++) {
+        int v = INT_VS[i];
+        int k;
+        vertex_flower_prefixes(v, alpha, bend, &k, Ms, P, S);
+        for (int s = 0; s < k; s++) {
+            int e = FLOWER_E[v][s];
+            int cs = VAR_OF_E[e];
+            cs_arr[s] = cs;
+            if (cs < 0) {
+                v01[s] = v02[s] = v12[s] = 0.0;
+            } else {
+                jac_contrib_at(alpha, bend[e], P[s], S[s+1],
+                               &v01[s], &v02[s], &v12[s]);
+                g[cs] += v01[s]*r[3*i+0] + v02[s]*r[3*i+1] + v12[s]*r[3*i+2];
+            }
+        }
+        for (int s = 0; s < k; s++) {
+            if (cs_arr[s] < 0) continue;
+            for (int t = 0; t < k; t++) {
+                if (cs_arr[t] < 0) continue;
+                int_t off = SLA_off_st[((size_t)i * MAXFLOWER + s) * MAXFLOWER + t];
+                if (off < 0) continue;
+                SLA_val[off] += v01[s]*v01[t] + v02[s]*v02[t] + v12[s]*v12[t];
+            }
+        }
+    }
+}
+
+/* Solve (A + λD) δ = -g. rhs/sol both stored in `bwork` (length NVAR).
+ * On entry: bwork = -g. On success: bwork = δ. Returns 0 ok, nonzero on
+ * SuperLU singular factorization. */
+static int sparse_lm_step_solve(double lam, const double *D, double *bwork) {
+    /* SLA_val_pl = SLA_val + λD on diagonal. */
+    memcpy(SLA_val_pl, SLA_val, (size_t)SLA_NNZ * sizeof(double));
+    for (int c = 0; c < NVAR; c++) {
+        int_t dpos = SLA_diag_pos[c];
+        if (dpos < 0) {
+            /* No A[c,c]; this should not happen in our problem (every var
+             * edge appears in some vertex flower at position s=t=that
+             * edge's slot, contributing v01²+v02²+v12² on the diagonal),
+             * but guard anyway. */
+            return -2;
+        }
+        SLA_val_pl[dpos] += lam * D[c];
+    }
+
+    SuperMatrix A, B;
+    SuperMatrix L = {0};
+    SuperMatrix U = {0};
+    dCreate_CompCol_Matrix(&A, NVAR, NVAR, SLA_NNZ,
+                            SLA_val_pl, SLA_rowidx, SLA_colptr,
+                            SLU_NC, SLU_D, SLU_GE);
+    dCreate_Dense_Matrix(&B, NVAR, 1, bwork, NVAR, SLU_DN, SLU_D, SLU_GE);
+
+    superlu_options_t options;
+    set_default_options(&options);
+    options.ColPerm = MY_PERMC;
+    SuperLUStat_t stat;
+    StatInit(&stat);
+
+    int_t info = 0;
+    dgssv(&options, &A, SLA_perm_c, SLA_perm_r, &L, &U, &B, &stat, &info);
+
+    Destroy_SuperMatrix_Store(&A);
+    Destroy_SuperMatrix_Store(&B);
+    if (L.Store) Destroy_SuperNode_Matrix(&L);
+    if (U.Store) Destroy_CompCol_Matrix(&U);
+    StatFree(&stat);
+    return (info == 0) ? 0 : -1;
+}
+#endif /* HAVE_SUPERLU */
+
 /* ---------- dent gate ----------------------------------------------------- */
 static double vertex_turn(int v, const double bend[]) {
     double s = 0;
@@ -787,38 +1052,68 @@ static LMOut solve_lm(double alpha, double bend_full[],
             out.success = true; out.iters = it; out.final_resid = norm;
             out.final_lambda = lam; out.msg = "tol"; goto done;
         }
-        /* J = ∂r/∂x analytical (lifted from canonical homotopy_stage). */
-        analytical_jacobian(alpha, bend_full, J);
-        (void)bend_tmp; (void)r_tmp_a; (void)r_tmp_b;  /* unused now; kept allocated for ABI continuity */
-        /* A = J^T J, g = J^T r */
-        for (int i = 0; i < N; i++) for (int j = 0; j < N; j++) {
-            double s = 0;
-            for (int k = 0; k < M; k++) s += J[k * N + i] * J[k * N + j];
-            A[i * N + j] = s;
+        (void)bend_tmp; (void)r_tmp_a; (void)r_tmp_b;
+        if (CFG_SOLVER == SOLVER_DENSE) {
+            /* J = ∂r/∂x analytical, then dense A = J^T J, g = J^T r. */
+            analytical_jacobian(alpha, bend_full, J);
+            for (int i = 0; i < N; i++) for (int j = 0; j < N; j++) {
+                double s = 0;
+                for (int k = 0; k < M; k++) s += J[k * N + i] * J[k * N + j];
+                A[i * N + j] = s;
+            }
+            for (int i = 0; i < N; i++) {
+                double s = 0;
+                for (int k = 0; k < M; k++) s += J[k * N + i] * r[k];
+                g[i] = s;
+            }
+            double max_diag = 0;
+            for (int i = 0; i < N; i++) if (A[i*N+i] > max_diag) max_diag = A[i*N+i];
+            double floor = tiny_rel * max_diag;
+            if (floor < 1e-30) floor = 1e-30;
+            for (int i = 0; i < N; i++) {
+                D[i] = A[i*N+i] > floor ? A[i*N+i] : floor;
+            }
         }
-        for (int i = 0; i < N; i++) {
-            double s = 0;
-            for (int k = 0; k < M; k++) s += J[k * N + i] * r[k];
-            g[i] = s;
+#ifdef HAVE_SUPERLU
+        else {
+            /* Sparse: build A and g directly via per-vertex contributions. */
+            sparse_lm_AtA_fill(alpha, bend_full, r, g);
+            double max_diag = 0;
+            for (int c = 0; c < N; c++) {
+                int_t dpos = SLA_diag_pos[c];
+                double diag = (dpos >= 0) ? SLA_val[dpos] : 0.0;
+                if (diag > max_diag) max_diag = diag;
+            }
+            double floor = tiny_rel * max_diag;
+            if (floor < 1e-30) floor = 1e-30;
+            for (int c = 0; c < N; c++) {
+                int_t dpos = SLA_diag_pos[c];
+                double diag = (dpos >= 0) ? SLA_val[dpos] : 0.0;
+                D[c] = diag > floor ? diag : floor;
+            }
         }
-        /* D_i = max(A_ii, tiny_rel * max(diag), 1e-30) */
-        double max_diag = 0;
-        for (int i = 0; i < N; i++) if (A[i * N + i] > max_diag) max_diag = A[i * N + i];
-        double floor = tiny_rel * max_diag;
-        if (floor < 1e-30) floor = 1e-30;
-        for (int i = 0; i < N; i++) {
-            D[i] = A[i * N + i] > floor ? A[i * N + i] : floor;
-        }
+#endif
 
         bool accepted = false;
         for (int rt = 0; rt < max_lm_retries; rt++) {
-            /* Awork = A + λ · diag(D); bwork = -g */
-            for (int i = 0; i < N; i++) {
-                for (int j = 0; j < N; j++) Awork[i * N + j] = A[i * N + j];
-                Awork[i * N + i] += lam * D[i];
-                bwork[i] = -g[i];
+            int sing;
+            if (CFG_SOLVER == SOLVER_DENSE) {
+                /* Awork = A + λ·diag(D); bwork = -g */
+                for (int i = 0; i < N; i++) {
+                    for (int j = 0; j < N; j++) Awork[i * N + j] = A[i * N + j];
+                    Awork[i * N + i] += lam * D[i];
+                    bwork[i] = -g[i];
+                }
+                sing = dense_solve(Awork, bwork, N);
             }
-            int sing = dense_solve(Awork, bwork, N);
+#ifdef HAVE_SUPERLU
+            else {
+                for (int i = 0; i < N; i++) bwork[i] = -g[i];
+                sing = sparse_lm_step_solve(lam, D, bwork);
+            }
+#else
+            else { sing = -1; /* unreachable */ }
+#endif
             if (sing) {
                 lam = lam * lambda_up;
                 if (lam > lambda_max) {
@@ -935,6 +1230,17 @@ int main(int argc, char **argv) {
             max_lm_retries = atoi(argv[++i]);
             if (max_lm_retries <= 0) die("--max-lm-retries must be > 0");
         }
+        else if (strcmp(argv[i], "--solver") == 0 && i + 1 < argc) {
+            const char *s = argv[++i];
+            if      (strcmp(s, "dense")  == 0) CFG_SOLVER = SOLVER_DENSE;
+            else if (strcmp(s, "sparse") == 0) {
+#ifdef HAVE_SUPERLU
+                CFG_SOLVER = SOLVER_SPARSE;
+#else
+                die("--solver sparse requires building with -DHAVE_SUPERLU");
+#endif
+            } else die("--solver must be 'dense' or 'sparse'");
+        }
         else if (strcmp(argv[i], "--print-bends") == 0) print_bends = 1;
         else if (strcmp(argv[i], "--bends-out") == 0 && i + 1 < argc) {
             bends_out = argv[++i];
@@ -966,6 +1272,12 @@ int main(int argc, char **argv) {
         free(u);
     }
 
+#ifdef HAVE_SUPERLU
+    if (CFG_SOLVER == SOLVER_SPARSE) {
+        if (sparse_lm_setup() != 0) die("sparse_lm_setup failed");
+    }
+#endif
+
     double t0 = now_secs();
     LMOut out = solve_lm(alpha, bend, tol, max_iter, max_lm_retries,
                          lambda_init, lambda_down, lambda_up, lambda_max, tiny_rel);
@@ -981,6 +1293,7 @@ int main(int argc, char **argv) {
     printf("max_iter: %d\n", max_iter);
     printf("tol: %.6e\n", tol);
     printf("solver: lm\n");
+    printf("solver_path: %s\n", CFG_SOLVER == SOLVER_DENSE ? "dense" : "sparse");
     printf("start: %s\n", start_kind == 0 ? "vertexwish" : "ideal");
     printf("success: %s\n", out.success ? "true" : "false");
     printf("iters: %d\n", out.iters);

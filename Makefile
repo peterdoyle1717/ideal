@@ -54,8 +54,15 @@ sparse: src/puffup_c_sparse
 
 # Experiment branch: standalone LM solver with vertexwish start. Not in
 # the default `all` target; build explicitly with `make src/puffup_c_lm`.
+# Default build is dense LU. For large NVAR (v ≳ 150) build the sparse
+# variant `src/puffup_c_lm_sparse` which links SuperLU.
 src/puffup_c_lm: src/puffup_c_lm.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
+
+src/puffup_c_lm_sparse: src/puffup_c_lm.c
+	$(CC) $(CFLAGS) -DHAVE_SUPERLU $(SUPERLU_INC) -o $@ $< $(SUPERLU_LIB) -lm
+
+lm-sparse: src/puffup_c_lm_sparse
 
 src/hyperpuff_c: src/hyperpuff_c.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
@@ -67,4 +74,4 @@ src/embed_check: src/embed_check.cpp
 	$(CXX) -O2 -std=c++17 $(CGAL_INC) -o $@ $< $(CGAL_LIB)
 
 clean:
-	rm -f src/horou_c src/horoz_c src/ideal_proof src/euclid_prover src/puffup_c src/puffup_c_sparse src/puffup_c_lm src/hyperpuff_c src/embed_check
+	rm -f src/horou_c src/horoz_c src/ideal_proof src/euclid_prover src/puffup_c src/puffup_c_sparse src/puffup_c_lm src/puffup_c_lm_sparse src/hyperpuff_c src/embed_check
