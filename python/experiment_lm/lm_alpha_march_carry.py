@@ -173,6 +173,12 @@ def main():
                     help="residual backend: matrix (default; 3 off-diagonals "
                          "of cumulative holomat) or quat (vector part of "
                          "cumulative holonomy quaternion, analytic Jacobian)")
+    ap.add_argument("--system", choices=("square", "all-bends"), default="square",
+                    help="solver formulation: square (default; var-edges are "
+                         "the 3V-9 non-base edges, base bends frozen at horou "
+                         "ideal, residuals at V-3 interior verts) or all-bends "
+                         "(overdetermined: var-edges = all 3V-6 edges, no base "
+                         "freeze, residuals at all V vertices, 3V × (3V-6))")
     ap.add_argument("--branch-vec-tol", type=float, default=1e-6,
                     help="quat post-check: a converged vertex has |vec(Q)| "
                          "below this AND qw should be negative (natural "
@@ -181,6 +187,9 @@ def main():
     args = ap.parse_args()
     if args.residual == "quat" and not _QUAT_AVAILABLE:
         sys.exit("ERROR: --residual quat requires python/quat_residual.py")
+    if args.system == "all-bends" and args.residual == "matrix":
+        sys.exit("ERROR: --system all-bends currently requires --residual quat "
+                 "(matrix backend not extended to all-bends in this commit)")
 
     netcode = decode(args.clers)
     faces = parse_netcode(netcode)
@@ -191,11 +200,22 @@ def main():
     base_face = faces[0]
     base_edges = [edge_key(base_face[i], base_face[(i + 1) % 3]) for i in range(3)]
     base_edge_set = set(base_edges)
-    var_edges = [e for e in tri.edges if e not in base_edge_set]
-    base_bend = {e: bends_ideal[e] for e in base_edges}
     base_face_set = set(base_face)
 
-    # Initial var-edge bends from horou ideal.
+    # System layout: square (3V-9 vars, residuals at V-3 interior verts) vs
+    # all-bends (3V-6 vars, residuals at all V verts, overdetermined by 6).
+    if args.system == "all-bends":
+        var_edges = list(tri.edges)               # ALL edges
+        base_bend = {}                             # nothing frozen
+        residual_vertices = list(tri.vertices)     # all V vertices
+        gate_vertices = list(tri.vertices)         # gate over all V vertices
+    else:
+        var_edges = [e for e in tri.edges if e not in base_edge_set]
+        base_bend = {e: bends_ideal[e] for e in base_edges}
+        residual_vertices = [v for v in tri.vertices if v not in base_face_set]
+        gate_vertices = list(residual_vertices)
+
+    # Initial var-edge bends from horou ideal (covers ALL edges in either mode).
     x = np.array([bends_ideal[e] for e in var_edges], dtype=float)
 
     target = math.radians(args.target_deg)
@@ -213,16 +233,31 @@ def main():
             tr = dict(bends_curr_dict)
             for e, v in zip(var_edges, x_trial):
                 tr[e] = float(v)
-            for v_ in tri.vertices:
-                if v_ in base_face_set:
-                    continue
+            for v_ in gate_vertices:
                 if vertex_turn(tri, v_, tr) < 0.0:
                     return False
             return True
         return gate
 
-    print(f"clers={args.clers}  V={len(tri.vertices)}  E={len(tri.edges)}  "
-          f"var={len(var_edges)}")
+    V = len(tri.vertices); E = len(tri.edges)
+    n_unknowns = len(var_edges)
+    n_residuals = 3 * len(residual_vertices)
+    overdet = n_residuals - n_unknowns
+    print(f"clers={args.clers}  V={V}  E={E}  system={args.system}  "
+          f"residual={args.residual}")
+    print(f"unknowns={n_unknowns}  residuals={n_residuals}  "
+          f"overdet={overdet:+d}")
+    if args.residual == "quat":
+        # One-time J probe at α=0 with horou ideal bends — shape/nnz are
+        # structural (independent of α); the values vary with α but the
+        # sparsity pattern does not.
+        try:
+            J0 = analytical_jacobian_quat_sparse(
+                tri, base_face, var_edges, x, base_bend, 0.0,
+                vertices=residual_vertices)
+            print(f"J shape={J0.shape}  nnz={J0.nnz}")
+        except Exception as e:
+            print(f"J probe failed: {e!r}")
     print(f"target={args.target_deg}°  init_step={args.init_step_deg}°  "
           f"min_step={args.min_step_deg}°  λ_init={args.lambda_init}  "
           f"max_quick_iter={args.max_quick_iter}  quick_tol={args.quick_tol}")
@@ -254,9 +289,11 @@ def main():
 
         if args.residual == "quat":
             F = lambda xv, a=alpha_try: holonomy_residual_quat(
-                tri, base_face, var_edges, xv, base_bend, a)
+                tri, base_face, var_edges, xv, base_bend, a,
+                vertices=residual_vertices)
             Jfn = lambda xv, a=alpha_try: analytical_jacobian_quat_sparse(
-                tri, base_face, var_edges, xv, base_bend, a)
+                tri, base_face, var_edges, xv, base_bend, a,
+                vertices=residual_vertices)
         else:
             F = lambda xv, a=alpha_try: holonomy_residual(
                 tri, base_face, var_edges, xv, base_bend, a)
@@ -310,9 +347,11 @@ def main():
         # Final tight LM at exactly the target.
         if args.residual == "quat":
             F = lambda xv: holonomy_residual_quat(
-                tri, base_face, var_edges, xv, base_bend, target)
+                tri, base_face, var_edges, xv, base_bend, target,
+                vertices=residual_vertices)
             Jfn = lambda xv: analytical_jacobian_quat_sparse(
-                tri, base_face, var_edges, xv, base_bend, target)
+                tri, base_face, var_edges, xv, base_bend, target,
+                vertices=residual_vertices)
         else:
             F = lambda xv: holonomy_residual(
                 tri, base_face, var_edges, xv, base_bend, target)
@@ -340,7 +379,8 @@ def main():
             # Suspect = converged but qw > 0.
             report = branch_check_post(tri, base_face, var_edges, x,
                                         base_bend, target,
-                                        vec_tol=args.branch_vec_tol)
+                                        vec_tol=args.branch_vec_tol,
+                                        vertices=residual_vertices)
             n_susp = sum(1 for r in report if r["suspect"])
             print()
             print(f"branch post-check (vec_tol={args.branch_vec_tol:.1e}):")
@@ -361,9 +401,19 @@ def main():
               f"{math.degrees(alpha_curr):.6f}°  retreats: {n_retreat}")
 
     wall = time.monotonic() - t_start
+    if not target_reached:
+        status = "STALLED_POSITIVE_RESIDUAL"
+    elif final_resid <= args.final_tol:
+        status = "SOLVER_TOL"
+    else:
+        msg = (out_final.message or "").lower()
+        if "lambda" in msg:
+            status = "LAMBDA_SATURATED_POSITIVE_RESIDUAL"
+        else:
+            status = "STALLED_POSITIVE_RESIDUAL"
     print(f"summary: clers={args.clers} target_reached={target_reached} "
           f"steps={n_step} retreats={n_retreat} "
-          f"final_resid={final_resid:.6e} wall={wall:.2f}s")
+          f"final_resid={final_resid:.6e} wall={wall:.2f}s status={status}")
 
 
 if __name__ == "__main__":

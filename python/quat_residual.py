@@ -128,18 +128,20 @@ def holonomy_residual_quat(
     var_values: np.ndarray,
     fixed_bend: Dict[Edge, float],
     alpha: float,
+    vertices: "Sequence[Vertex] | None" = None,
 ) -> np.ndarray:
-    """Stacked vector parts (qx, qy, qz) of per-interior-vertex holonomy
-    quaternions. Same shape as puffup.holonomy_residual: 3 × N_INT.
+    """Stacked vector parts (qx, qy, qz) of per-vertex holonomy quats.
 
-    No branch check. The LM solver minimizes this residual; sheet
-    diagnostics happen post-convergence via branch_check_post."""
+    Default (vertices=None): interior vertices only (V−3 of them).
+    Pass vertices=tri.vertices for the all-bends overdetermined system
+    where every vertex's holonomy contributes 3 residual rows."""
     bend = dict(fixed_bend)
     for e, val in zip(var_edges, var_values):
         bend[e] = float(val)
-    interior_vs = [v for v in tri.vertices if v not in base_face]
-    out = np.empty(3 * len(interior_vs), dtype=float)
-    for i, v in enumerate(interior_vs):
+    if vertices is None:
+        vertices = [v for v in tri.vertices if v not in base_face]
+    out = np.empty(3 * len(vertices), dtype=float)
+    for i, v in enumerate(vertices):
         Q = vertex_holonomy_quat(tri, v, alpha, bend)
         out[3*i + 0] = Q[1]
         out[3*i + 1] = Q[2]
@@ -154,30 +156,34 @@ def analytical_jacobian_quat_sparse(
     var_values: np.ndarray,
     fixed_bend: Dict[Edge, float],
     alpha: float,
+    vertices: "Sequence[Vertex] | None" = None,
 ) -> sp.csc_matrix:
-    """Sparse CSC analytic Jacobian of holonomy_residual_quat. Pattern
-    matches the matrix backend's analytical_jacobian_sparse: each
-    vertex contributes 3 rows × (var-edges in v's flower) cols.
+    """Sparse CSC analytic Jacobian of holonomy_residual_quat.
+
+    Default (vertices=None): rows correspond to interior-vertex
+    holonomies (square system).
+    All-bends mode: pass vertices=tri.vertices so rows correspond to
+    every vertex (3V × E with E = len(var_edges) = 3V − 6 typically).
 
     Prefix/suffix product trick:
       Q = q_0 · … · q_{k-1};   P[t] = ∏_{s<t} q_s,   S[t] = ∏_{s≥t} q_s
       ∂Q/∂β_t = P[t] · (dq_t/dβ_t) · S[t+1]
-
-    The vector part of ∂Q/∂β_t gives the three Jacobian entries for
-    that (vertex, var-edge) at rows 3·vi+(0,1,2)."""
+    The vector part of ∂Q/∂β_t gives the 3 Jacobian entries for that
+    (vertex, var-edge) at rows 3·vi + (0,1,2)."""
     bend = dict(fixed_bend)
     for e, val in zip(var_edges, var_values):
         bend[e] = float(val)
-    interior_vs = [v for v in tri.vertices if v not in base_face]
+    if vertices is None:
+        vertices = [v for v in tri.vertices if v not in base_face]
     var_idx = {e: i for i, e in enumerate(var_edges)}
     n_vars = len(var_edges)
-    n_rows = 3 * len(interior_vs)
+    n_rows = 3 * len(vertices)
 
     rows: List[int] = []
     cols: List[int] = []
     vals: List[float] = []
 
-    for vi, v in enumerate(interior_vs):
+    for vi, v in enumerate(vertices):
         k, qs, dqs, edges = _flower_steps(tri, v, alpha, bend)
         # Prefix products P[0..k]: P[t] = q_0 · … · q_{t-1}, P[0] = identity.
         P = [(1.0, 0.0, 0.0, 0.0)]
@@ -219,21 +225,22 @@ def branch_check_post(
     fixed_bend: Dict[Edge, float],
     alpha: float,
     vec_tol: float = 1e-6,
+    vertices: "Sequence[Vertex] | None" = None,
 ):
-    """Post-convergence sanity. For each interior vertex, compute Q
-    and report (vec_norm, qw). Flag any vertex where the residual
-    has converged (|vec(Q)| < vec_tol) but qw is positive — that
-    is the wrong sheet relative to the natural −1 lift for a
-    once-around loop, and signals something is off.
+    """Post-convergence sanity. For each chosen vertex, compute Q
+    and report (vec_norm, qw). Default = interior vertices (square
+    system). All-bends mode: pass vertices=tri.vertices.
 
-    Returns a list of dicts (one per interior vertex), each with
-    keys: vertex, qw, qx, qy, qz, vec_norm, suspect (bool)."""
+    Flag any vertex where the residual has converged (|vec(Q)| <
+    vec_tol) but qw is positive — that is the wrong sheet relative
+    to the natural −1 lift for a once-around loop."""
     bend = dict(fixed_bend)
     for e, val in zip(var_edges, var_values):
         bend[e] = float(val)
-    interior_vs = [v for v in tri.vertices if v not in base_face]
+    if vertices is None:
+        vertices = [v for v in tri.vertices if v not in base_face]
     out = []
-    for v in interior_vs:
+    for v in vertices:
         Q = vertex_holonomy_quat(tri, v, alpha, bend)
         vec_norm = math.sqrt(Q[1]**2 + Q[2]**2 + Q[3]**2)
         suspect = (vec_norm < vec_tol) and (Q[0] > 0.0)
