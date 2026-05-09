@@ -36,6 +36,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 #include <ctype.h>
+#include <errno.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -1590,6 +1591,7 @@ static void usage(FILE *fh) {
         "  --max-attempts N                 (default: 2000)\n"
         "  --solver dense|sparse            (default: sparse if HAVE_SUPERLU)\n"
         "  --bends-out FILE                 (single-case mode only)\n"
+        "  --bends-out-dir DIR              (chunk mode: dump <md5>.bends per SOLVER_TOL case)\n"
         "  --dent-gate-trace                (print dent rejections to stderr)\n"
         "  --fd-spot-check --alpha-deg N    (analytic vs FD on horou-ideal bends)\n"
         "  --input-list FILE --output-tsv F (chunk mode; CLERS lines via --clers-list optional)\n"
@@ -1613,6 +1615,7 @@ int main(int argc, char **argv) {
     opts.quick_min_drop = 1e-2;
     opts.alpha_jump_policy = 0;  /* full */
     const char *bends_out = NULL;
+    const char *bends_out_dir = NULL;
     const char *input_list = NULL;
     const char *output_tsv = NULL;
     const char *clers_list = NULL;
@@ -1666,6 +1669,8 @@ int main(int argc, char **argv) {
             } else die("--solver must be 'dense' or 'sparse'");
         } else if (strcmp(argv[i], "--bends-out") == 0 && i + 1 < argc) {
             bends_out = argv[++i];
+        } else if (strcmp(argv[i], "--bends-out-dir") == 0 && i + 1 < argc) {
+            bends_out_dir = argv[++i];
         } else if (strcmp(argv[i], "--dent-gate-trace") == 0) {
             CFG_DENT_TRACE = 1;
         } else if (strcmp(argv[i], "--fd-spot-check") == 0) {
@@ -1746,7 +1751,22 @@ int main(int argc, char **argv) {
             MarchResult res;
             double *bend = (double *)xcalloc(MAXE, sizeof(double));
             int nv_out = 0;
-            run_one_case(line, &opts, &res, bend, &nv_out);
+            int rc = run_one_case(line, &opts, &res, bend, &nv_out);
+            if (bends_out_dir && rc == 0 && strcmp(res.status, "SOLVER_TOL") == 0) {
+                char md5[33];
+                md5_to_hex((const unsigned char *)line, strlen(line), md5);
+                char path[2048];
+                snprintf(path, sizeof(path), "%s/%s.bends", bends_out_dir, md5);
+                FILE *bf = fopen(path, "w");
+                if (!bf) {
+                    fprintf(stderr, "lm_march_c: fopen %s: %s\n", path, strerror(errno));
+                } else {
+                    write_puffup_bends(bf, line, bend, opts.target_deg * PI / 180.0);
+                    if (fclose(bf) != 0) {
+                        fprintf(stderr, "lm_march_c: fclose %s: %s\n", path, strerror(errno));
+                    }
+                }
+            }
             free(bend);
             write_tsv_row(fout, nv_out, clers, line, &res);
             n_done++;
